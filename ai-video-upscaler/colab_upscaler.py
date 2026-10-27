@@ -49,14 +49,16 @@ import uuid
 from fractions import Fraction
 from pathlib import Path
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 
 try:
     IN_COLAB = importlib.util.find_spec("google.colab") is not None
 except ModuleNotFoundError:
     IN_COLAB = False
+if IN_COLAB:
+    print(f"⏳ AI Video Upscaler v{VERSION} yükleniyor… (modeller ilk seferde indirilir, 1-2 dk sürebilir)", flush=True)
 
-# Ortam değişkenleri (UPSCALER_TUNEL=yok gibi) form değerlerini ezer; yerel test içindir.
+# Ortam değişkenleri (UPSCALER_TUNEL=yok gibi) form değerlerini ezer; başlatıcı hücre ve yerel test içindir.
 for _key in ("NGROK_TOKEN", "NGROK_DOMAIN", "SIFRE", "TUNEL"):
     if os.environ.get("UPSCALER_" + _key):
         globals()[_key] = os.environ["UPSCALER_" + _key]
@@ -1812,5 +1814,5 @@ def main():
         print("Site kapatıldı. Tekrar açmak için hücreyi yeniden çalıştırın.", flush=True)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" or IN_COLAB:  # Colab'da her koşulda başlasın
     main()

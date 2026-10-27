@@ -24,26 +24,27 @@ Hepsi ücretsiz araçlardır; ek bir ücretli hizmet gerekmez.
 3. **Domains** sayfasında hesabınıza tanımlı ücretsiz sabit adresi kopyalayın (ör. `benim-adim.ngrok-free.app`):
    https://dashboard.ngrok.com/domains
 
-### 2) Colab
+### 2) Colab (önerilen: kısa başlatıcı hücre)
 1. https://colab.research.google.com → **Yeni not defteri**.
 2. Menü: **Çalışma zamanı → Çalışma zamanı türünü değiştir → L4 GPU** (T4 de çalışır, daha yavaştır).
-3. [`colab_upscaler.py`](colab_upscaler.py) dosyasının **tamamını** tek bir hücreye yapıştırın.
-4. Sağdaki formda `NGROK_TOKEN` ve `NGROK_DOMAIN` alanlarını doldurun, ▶ ile çalıştırın.
-5. Çıktıda görünen `🌐 WEB ARAYÜZÜ: https://…` linkine tıklayın. İlk girişte ngrok uyarı sayfasında **Visit Site**'a basın.
+3. [`colab_baslat.py`](colab_baslat.py) içeriğini (20 satır) tek bir hücreye yapıştırın. Bu hücre asıl kodu
+   GitHub'dan indirip çalıştırır; 1800 satırı elle kopyalamanız gerekmez.
+4. Formda `NGROK_TOKEN` (ve isterseniz `NGROK_DOMAIN`) alanlarını doldurun, ▶ ile çalıştırın.
+5. İlk saniyede `⏳ … yükleniyor` yazısı çıkar; modeller indikten sonra `🌐 WEB ARAYÜZÜ: https://…` linki görünür.
+   İlk girişte ngrok uyarı sayfasında **Visit Site**'a basın.
+
+**Hücre çalıştığı sürece site açıktır** — hücrenin dönmeye devam etmesi normaldir. Hücre birkaç saniyede
+"bitti" görünüyorsa site kapanmış demektir; çıktıdaki hata mesajına bakın.
 
 > Hazır not defteri: [AI_Video_Upscaler.ipynb](AI_Video_Upscaler.ipynb) — GitHub'da açıp **"Open in Colab"** ile
-> doğrudan Colab'a aktarabilirsiniz. Tek hücre, GPU ayarı içinde hazır gelir.
+> doğrudan Colab'a aktarabilirsiniz (başlatıcı hücre ve L4 GPU ayarı hazır gelir).
 
-**Alternatif (kodu yapıştırmadan, 3 satır):**
+**Alternatif — kodun tamamını yapıştırmak:** [`colab_upscaler.py`](colab_upscaler.py) dosyasını GitHub'da açıp
+**Raw** → `Ctrl+A` → `Ctrl+C` (veya "Copy raw file" butonu) ile kopyalayın. Ekranda seçerek kopyalarsanız dosyanın
+sonu eksik kalabilir; o zaman hücre **0 sn'de biter** ve hiçbir şey olmaz.
 
-```python
-%env UPSCALER_NGROK_TOKEN=buraya_token
-%env UPSCALER_NGROK_DOMAIN=benim-adim.ngrok-free.app
-!wget -q -O up.py https://raw.githubusercontent.com/Emirhanbaba31/discord-altyapi-bot/claude/ai-video-upscaler-bot-ilz55b/ai-video-upscaler/colab_upscaler.py && echo indirildi
-%run up.py
-```
-
-(Branch `master`'a birleştirildiyse linkteki `claude/ai-video-upscaler-bot-ilz55b` kısmını `master` yapın.)
+(Branch `master`'a birleştirildiyse `colab_baslat.py` içindeki linkte `claude/ai-video-upscaler-bot-ilz55b`
+kısmını `master` yapın.)
 
 ---
 
@@ -94,6 +95,7 @@ uzun videolarda **⚡ Hızlı** model birkaç kat daha hızlıdır. Gerçek hız
 
 | Sorun | Çözüm |
 |---|---|
+| Hücre 0 sn'de bitiyor, link çıkmıyor | Kod eksik yapıştırılmış. [`colab_baslat.py`](colab_baslat.py) başlatıcı hücresini kullanın. |
 | `ERR_NGROK_108` / `ERR_NGROK_334` | Aynı ngrok hesabı başka bir yerde açık. Diğer Colab hücresini durdurun veya https://dashboard.ngrok.com/agents sayfasından kapatın. |
 | `ERR_NGROK_4018` | Token hatalı; yeniden kopyalayın. |
 | "GPU bulunamadı" | Çalışma zamanı türünü **L4 GPU** yapın ve hücreyi yeniden çalıştırın. |
