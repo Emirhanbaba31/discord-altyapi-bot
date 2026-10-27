@@ -1,3 +1,6 @@
+> 🎬 **Yeni:** Google Colab'da tek hücreyle çalışan, sabit linkli web arayüzlü **AI Video Upscaler + FPS
+> İnterpolasyon** botu → [`ai-video-upscaler/`](ai-video-upscaler/README.md)
+
 Bot Altyapı Projesine Hoşgeldin!
 =================
 Merhaba Arkadaşlar Bu Altyapı 2018 Yılında Yapılmış 2021 Yılında İse Gerekli Düzeltmeleri Yapılmıştır. Bu Altyapı Discord.js v12 Sürümünü Artık Desteklemektedir! Kolaylıkla Kullanabilirsiniz!
