@@ -13,7 +13,7 @@ NGROK_DOMAIN = ""  #@param {type:"string"}
 #@markdown ### ⚙️ Diğer ayarlar
 #@markdown **SIFRE:** Siteye girişte şifre sorulsun (boş = şifresiz). Kullanıcı adı alanına herhangi bir şey yazabilirsiniz.
 SIFRE = ""  #@param {type:"string"}
-#@markdown **DRIVE_KAYDET:** Biten videolar Google Drive'da `AI_Upscaler` klasörüne de kopyalansın (Colab kapansa da kaybolmaz).
+#@markdown **DRIVE_KAYDET:** Google Drive bağlansın: biten videolar Drive'da `AI_Upscaler` klasörüne kopyalanır ve arayüzden Drive'daki videoları seçebilirsiniz.
 DRIVE_KAYDET = False  #@param {type:"boolean"}
 #@markdown **TUNEL:** `ngrok` = link hiç değişmez · `cloudflare` = hesap gerekmez ama link her çalıştırmada değişir.
 TUNEL = "ngrok"  #@param ["ngrok", "cloudflare"]
@@ -21,7 +21,7 @@ TUNEL = "ngrok"  #@param ["ngrok", "cloudflare"]
 # =============================================================================
 #  Buradan aşağısını değiştirmenize gerek yok.
 #  Büyütme : Real-ESRGAN (RealESRGAN_x4plus / x2plus / x4plus_anime_6B / realesr-general-x4v3)
-#  Ara kare: RIFE 4.26 (Practical-RIFE) + yinelenen kare ayıklama + sahne geçişi koruması
+#  Ara kare: RIFE 4.26 (Practical-RIFE) + yinelenen kare ayıklama + sahne geçişi koruması + ağır çekim
 #  Kodlama : NVENC 10-bit HEVC / H.264 (p7 + multipass + AQ) → libx265/libx264 yedekli
 #  L4 / A100 gibi büyük GPU'larda: fp16 + channels_last + TF32, toplu (batch) RIFE
 # =============================================================================
@@ -31,6 +31,7 @@ import builtins
 import hashlib
 import hmac
 import importlib.util
+import io
 import json
 import math
 import os
@@ -49,7 +50,7 @@ import uuid
 from fractions import Fraction
 from pathlib import Path
 
-VERSION = "2.0.1"
+VERSION = "3.0.0"
 
 try:
     IN_COLAB = importlib.util.find_spec("google.colab") is not None
@@ -68,10 +69,13 @@ if os.environ.get("UPSCALER_DRIVE_KAYDET"):
 PORT = int(os.environ.get("UPSCALER_PORT", "7860"))
 BASE = Path(os.environ.get("UPSCALER_DIR") or ("/content/ai_upscaler" if IN_COLAB else "ai_upscaler_data")).resolve()
 UP_DIR, OUT_DIR, WORK_DIR, MODEL_DIR, BIN_DIR = (BASE / d for d in ("uploads", "outputs", "work", "models", "bin"))
-DRIVE_DIR = None
+DRIVE_ROOT = Path(os.environ.get("UPSCALER_DRIVE_ROOT") or "/content/drive/MyDrive")
+DRIVE_DIR = None  # Drive bağlıysa: DRIVE_ROOT / "AI_Upscaler"
 CHUNK = 8 * 1024 * 1024
 DL_SECRET = secrets.token_bytes(16)
 DL_STATE = {"base": None}
+VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".flv", ".ts", ".mts", ".m2ts", ".wmv", ".mpg",
+              ".mpeg", ".3gp")
 
 _RE = "https://github.com/xinntao/Real-ESRGAN/releases/download/"
 SR_MODELS = {
@@ -85,9 +89,12 @@ RIFE_URL = "https://github.com/Fannovel16/ComfyUI-Frame-Interpolation/releases/d
 RES_TARGETS = {"orig": None, "1080": 1080, "1440": 1440, "2160": 2160}
 RES_LABELS = {"orig": "orijinal", "1080": "1080p", "1440": "2K", "2160": "4K"}
 FPS_CHOICES = ("orig", "60", "90", "120")
+SLOW_CHOICES = ("1", "2", "4", "8")
 MODEL_CHOICES = ("kalite", "hizli", "anime")
 CODEC_CHOICES = ("h265", "h264")
 QUALITY_CHOICES = ("maksimum", "yuksek", "dengeli")
+HDR_VF = ("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,"
+          "zscale=t=bt709:m=bt709:r=tv,format=yuv420p10le")
 
 _MAIN_THREAD = threading.main_thread()
 _LOGQ = queue.Queue()
@@ -136,6 +143,38 @@ def download(url, dst, label):
     raise RuntimeError(f"{label} indirilemedi: {last}")
 
 
+def save_json(path, data):
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def fmt_ts(sec, precise=False):
+    """Saniye → 'd:ss' / 's:dd:ss'; precise=True ise kesirli saniyeyi de gösterir (ör. 0:01.5)."""
+    sec = max(0.0, float(sec))
+    whole = int(sec) if precise else int(round(sec))
+    h, m, s = whole // 3600, whole % 3600 // 60, whole % 60
+    frac = sec - whole if precise else 0.0
+    ss = f"{s:02d}" + (f"{frac:.2f}"[1:].rstrip("0").rstrip(".") if frac >= 0.005 else "")
+    return f"{h}:{m:02d}:{ss}" if h else f"{m}:{ss}"
+
+
+def parse_time(v):
+    """'', '90', '1:30', '01:02:03.5' → saniye (boş → None)."""
+    v = str(v if v is not None else "").strip().replace(",", ".")
+    if not v:
+        return None
+    parts = v.split(":")
+    if len(parts) > 3:
+        raise ValueError(v)
+    sec = 0.0
+    for p in parts:
+        sec = sec * 60 + float(p)
+    if not math.isfinite(sec) or sec < 0:
+        raise ValueError(v)
+    return sec
+
+
 # =============================================================================
 #  GPU ayarları ve model mimarileri (Real-ESRGAN, RIFE 4.26) — ağırlıklarla birebir uyumlu
 # =============================================================================
@@ -154,6 +193,7 @@ if HALF:
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cuda.matmul.allow_tf32 = True
 MEM_FMT = torch.channels_last if HALF else torch.contiguous_format
+GPU_LOCK = threading.Lock()  # iş ve önizleme aynı anda GPU'yu kullanırken sırayla girsin
 
 
 class SRVGGNetCompact(nn.Module):
@@ -392,6 +432,14 @@ class SRRunner:
         return y[:, :, p * s:(p + h) * s, p * s:(p + w) * s]
 
 
+def sr_upscale(sr, x, out_w, out_h):
+    """(1,3,h,w) float32 [0,1] → AI ile büyütülüp tam (out_h, out_w) boyutuna getirilmiş float32."""
+    y = sr(x.half() if HALF else x).float()
+    if y.shape[-2:] != (out_h, out_w):
+        y = F.interpolate(y, size=(out_h, out_w), mode="bicubic", align_corners=False, antialias=True)
+    return y.clamp_(0, 1)
+
+
 class RifeRunner:
     def __init__(self, net):
         self.net, self.batch = net, (4 if BIG_GPU else 2)
@@ -425,36 +473,38 @@ class RifeRunner:
 
 class ModelStore:
     def __init__(self):
-        self.sr_cache, self.rife_runner = {}, None
+        self.sr_cache, self.rife_runner, self.lock = {}, None, threading.Lock()
 
     def sr(self, name):
-        if name not in self.sr_cache:
-            path = download(SR_MODELS[name], MODEL_DIR / f"{name}.pth", name)
-            try:
-                sd = _load_state(path)
-            except Exception:  # bozuk indirme → bir kez daha indir
-                path.unlink(missing_ok=True)
-                sd = _load_state(download(SR_MODELS[name], path, name))
-            net, scale = _build_sr(sd)
-            net.load_state_dict(sd, strict=True)
-            net.eval().requires_grad_(False).to(DEV, memory_format=MEM_FMT)
-            if HALF:
-                net.half()
-            if len(self.sr_cache) >= (4 if BIG_GPU else 2):
-                self.sr_cache.clear()
+        with self.lock:
+            if name not in self.sr_cache:
+                path = download(SR_MODELS[name], MODEL_DIR / f"{name}.pth", name)
+                try:
+                    sd = _load_state(path)
+                except Exception:  # bozuk indirme → bir kez daha indir
+                    path.unlink(missing_ok=True)
+                    sd = _load_state(download(SR_MODELS[name], path, name))
+                net, scale = _build_sr(sd)
+                net.load_state_dict(sd, strict=True)
+                net.eval().requires_grad_(False).to(DEV, memory_format=MEM_FMT)
                 if HALF:
-                    torch.cuda.empty_cache()
-            self.sr_cache[name] = SRRunner(net, scale)
-        return self.sr_cache[name]
+                    net.half()
+                if len(self.sr_cache) >= (4 if BIG_GPU else 2):
+                    self.sr_cache.clear()
+                    if HALF:
+                        torch.cuda.empty_cache()
+                self.sr_cache[name] = SRRunner(net, scale)
+            return self.sr_cache[name]
 
     def rife(self):
-        if self.rife_runner is None:
-            path = download(RIFE_URL, MODEL_DIR / "rife426.pth", "RIFE 4.26")
-            sd = {k: v for k, v in _load_state(path).items() if not k.startswith(("teacher.", "caltime."))}
-            net = IFNet()
-            net.load_state_dict(sd, strict=True)
-            self.rife_runner = RifeRunner(net.eval().requires_grad_(False).to(DEV))
-        return self.rife_runner
+        with self.lock:
+            if self.rife_runner is None:
+                path = download(RIFE_URL, MODEL_DIR / "rife426.pth", "RIFE 4.26")
+                sd = {k: v for k, v in _load_state(path).items() if not k.startswith(("teacher.", "caltime."))}
+                net = IFNet()
+                net.load_state_dict(sd, strict=True)
+                self.rife_runner = RifeRunner(net.eval().requires_grad_(False).to(DEV))
+            return self.rife_runner
 
 
 MODELS = ModelStore()
@@ -555,12 +605,11 @@ def probe_video(path):
     }
 
 
-def build_decode_cmd(path, info, fps, size=None):
+def build_decode_cmd(path, info, fps, size=None, start=None, dur=None, frames=None):
     """Kaynak → RGB (8-bit kaynakta rgb24, 10-bit/HDR kaynakta rgb48le) ham kare akışı."""
     vf, matrix, rng = [], info["matrix"], info["range"]
     if info["hdr"] and HAS_ZSCALE:  # HDR (iPhone vb.) → SDR ton eşleme, 10-bit hassasiyette
-        vf.append("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,"
-                  "zscale=t=bt709:m=bt709:r=tv,format=yuv420p10le")
+        vf.append(HDR_VF)
         matrix, rng = "bt709", "tv"
     vf.append(f"fps=fps={frac_str(fps)}")
     pix = "rgb48le" if info["deep"] else "rgb24"
@@ -569,8 +618,15 @@ def build_decode_cmd(path, info, fps, size=None):
     if rng in ("tv", "pc"):
         sc += f":in_range={rng}"
     vf += [sc, f"format={pix}"]
-    return ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-i", str(path), "-map", f"0:{info['vindex']}",
-            "-an", "-sn", "-dn", "-vf", ",".join(vf), "-f", "rawvideo", "-pix_fmt", pix, "-"]
+    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error"]
+    if start:
+        cmd += ["-ss", f"{start:.3f}"]
+    if dur:
+        cmd += ["-t", f"{dur:.3f}"]
+    cmd += ["-i", str(path), "-map", f"0:{info['vindex']}", "-an", "-sn", "-dn", "-vf", ",".join(vf)]
+    if frames:
+        cmd += ["-frames:v", str(frames)]
+    return cmd + ["-f", "rawvideo", "-pix_fmt", pix, "-"]
 
 
 def encoder_candidates(codec, quality, w, h, fps):
@@ -748,6 +804,11 @@ def to_tensor(arr):
     return t.permute(2, 0, 1).unsqueeze(0)
 
 
+def to_uint8_image(t):
+    """(1,3,H,W) float [0,1] → (H,W,3) uint8 numpy."""
+    return t[0].permute(1, 2, 0).mul(255).round_().clamp_(0, 255).to(torch.uint8).cpu().numpy()
+
+
 def rgb_to_yuv(x, pix):
     """(B,3,H,W) RGB [0,1] → BT.709 sınırlı aralık yuv420p (8-bit) veya p010le (10-bit) — dönüşüm GPU'da."""
     kr, kb = 0.2126, 0.0722
@@ -763,6 +824,20 @@ def rgb_to_yuv(x, pix):
         return torch.where(out >= 32768, out - 65536, out).to(torch.int16)  # uint16 bit deseni
     out = torch.cat(((16 + 219 * y).flatten(1), (128 + 224 * u).flatten(1), (128 + 224 * v).flatten(1)), 1)
     return out.round_().clamp_(0, 255).to(torch.uint8)
+
+
+def encode_jpeg(arr, quality=92):
+    try:
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.fromarray(arr).save(buf, "JPEG", quality=quality, subsampling=0, optimize=True)
+        return buf.getvalue()
+    except ImportError:
+        h, w, _ = arr.shape
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s",
+                            f"{w}x{h}", "-i", "-", "-frames:v", "1", "-q:v", "2", "-f", "mjpeg", "-"],
+                           input=arr.tobytes(), capture_output=True)
+        return r.stdout
 
 
 _SSIM_WIN = {}
@@ -800,30 +875,47 @@ def _ssim(a, b):
     return float(s.mean())
 
 
-def dl_token(jid):
-    return hmac.new(DL_SECRET, jid.encode(), hashlib.sha256).hexdigest()[:32]
+def dl_token(key):
+    return hmac.new(DL_SECRET, key.encode(), hashlib.sha256).hexdigest()[:32]
 
 
 # =============================================================================
-#  İş kuyruğu ve işleme hattı
+#  Paylaşılan durum: videolar (kaynaklar), işler, sistem bilgisi
 # =============================================================================
-JOBS, UPLOADS = {}, {}
+JOBS, SOURCES, PREVIEWS = {}, {}, {}
 JLOCK = threading.Lock()
 JOBQ = queue.Queue()
 STATE = {"version": 0}
+SYS = {}
 
-PUBLIC_KEYS = ("id", "name", "status", "stage", "progress", "fps_proc", "eta", "created", "started", "finished",
-               "error", "out_name", "out_size", "in_desc", "out_desc", "opts", "engine", "done", "total", "drive")
+JOB_KEYS = ("id", "name", "source_id", "status", "stage", "progress", "fps_proc", "eta", "created", "started",
+            "finished", "error", "out_name", "out_size", "in_desc", "out_desc", "opts", "engine", "done", "total",
+            "drive")
+SRC_KEYS = ("id", "name", "origin", "status", "stage", "progress", "info", "error", "size", "created", "thumb")
 
 
-def job_set(job, **kw):
+def bump(obj=None, **kw):
     with JLOCK:
-        job.update(kw)
+        if obj is not None:
+            obj.update(kw)
+        STATE["version"] += 1
+
+
+job_set = src_set = bump
+
+
+def registry_put(reg, key, value):
+    """Sözlüğe ekle/çıkar (value=None) ve aynı kilit içinde sürümü artır ki canlı akış değişikliği kaçırmasın."""
+    with JLOCK:
+        if value is None:
+            reg.pop(key, None)
+        else:
+            reg[key] = value
         STATE["version"] += 1
 
 
 def job_public(job):
-    d = {k: job.get(k) for k in PUBLIC_KEYS}
+    d = {k: job.get(k) for k in JOB_KEYS}
     if job.get("status") == "done":
         d["dl_token"] = dl_token(job["id"])
     return d
@@ -838,9 +930,204 @@ def snapshot():
             d = job_public(j)
             d["queue_pos"] = queued.index(j["id"]) + 1 if j["id"] in queued else 0
             out.append(d)
-        return {"jobs": out, "version": STATE["version"], "dl_base": DL_STATE["base"]}
+        srcs = [{k: s.get(k) for k in SRC_KEYS} for s in sorted(SOURCES.values(), key=lambda s: s["created"])]
+        return {"jobs": out, "sources": srcs, "version": STATE["version"], "dl_base": DL_STATE["base"],
+                "drive": bool(DRIVE_DIR)}
 
 
+def sys_monitor(stop_event):
+    smi = shutil.which("nvidia-smi") if HALF else None
+    while not stop_event.is_set():
+        d = {}
+        try:
+            d["disk_free_gb"] = round(shutil.disk_usage(BASE).free / 1e9, 1)
+        except OSError:
+            pass
+        if smi:
+            try:
+                r = run([smi, "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu",
+                         "--format=csv,noheader,nounits"], timeout=10)
+                u, mu, mt, tc = (float(x) for x in r.stdout.splitlines()[0].split(","))
+                d.update(gpu_util=int(u), mem_used=round(mu / 1024, 1), mem_total=round(mt / 1024, 1), temp=int(tc))
+            except Exception:  # noqa: BLE001
+                pass
+        SYS.clear()
+        SYS.update(d, gpu=GPU_NAME)
+        stop_event.wait(3)
+
+
+# --- Kaynak videolar (yükleme, link, Drive) ---------------------------------
+def new_source(name, origin, size=0, status="uploading", ext=".mp4"):
+    sid = uuid.uuid4().hex[:12]
+    src = {"id": sid, "name": name, "origin": origin, "path": str(UP_DIR / f"{sid}{ext}"), "size": size,
+           "status": status, "stage": "", "progress": 0.0, "info": None, "error": None, "created": time.time(),
+           "thumb": False}
+    registry_put(SOURCES, sid, src)
+    return src
+
+
+def make_thumb(path, info, dst):
+    pos = max(0.0, min(info["duration"] * 0.15, info["duration"] - 0.2)) if info["duration"] else 0.0
+    vf = (HDR_VF + "," if info["hdr"] and HAS_ZSCALE else "") + "scale=320:-2"
+    r = run(["ffmpeg", "-hide_banner", "-v", "error", "-y", "-ss", f"{pos:.3f}", "-i", str(path), "-map",
+             f"0:{info['vindex']}", "-frames:v", "1", "-vf", vf, "-q:v", "4", str(dst)], timeout=120)
+    return r.returncode == 0 and Path(dst).exists()
+
+
+def finalize_source(src):
+    """Videoyu incele, küçük resim üret, kalıcı kaydet → hazır (ya da hata)."""
+    src_set(src, status="processing", stage="Video inceleniyor", progress=1.0)
+    try:
+        info = probe_video(src["path"])
+    except Exception as e:  # noqa: BLE001
+        src_set(src, status="error", stage="", error=f"Video okunamadı: {e}")
+        Path(src["path"]).unlink(missing_ok=True)
+        return False
+    thumb = make_thumb(src["path"], info, UP_DIR / f"{src['id']}_thumb.jpg")
+    src_set(src, status="ready", stage="", info=info, thumb=thumb, size=os.path.getsize(src["path"]))
+    save_json(UP_DIR / f"{src['id']}.json", {k: src[k] for k in ("id", "name", "origin", "path", "size", "info",
+                                                                    "created")})
+    log(f"Video hazır: {src['name']} ({src['size'] / 1024 ** 2:.1f} MB, {info['width']}x{info['height']} @ "
+        f"{info['fps']} fps, {fmt_ts(info['duration'])})")
+    return True
+
+
+def _progress_updater(src, total, label):
+    state = {"t0": time.time(), "last": 0.0}
+
+    def update(got):
+        now = time.time()
+        if now - state["last"] < 0.5:
+            return
+        state["last"] = now
+        speed = got / max(now - state["t0"], 1e-6)
+        pct = got / total if total else 0.0
+        eta = f" · kalan {fmt_ts((total - got) / speed)}" if total and speed > 0 else ""
+        src_set(src, progress=min(pct, 0.999),
+                stage=f"{label} {got / 1024 ** 2:.0f} MB{f' / {total / 1024 ** 2:.0f} MB' if total else ''}"
+                      f" · {speed / 1024 ** 2:.1f} MB/sn{eta}")
+
+    return update
+
+
+def _copy_stream(src, fin, dst, total, label):
+    update = _progress_updater(src, total, label)
+    got = 0
+    with open(dst, "wb") as f:
+        while True:
+            chunk = fin.read(1 << 20)
+            if not chunk:
+                break
+            f.write(chunk)
+            got += len(chunk)
+            update(got)
+    return got
+
+
+def _download_direct(src, url, require_video=False):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 ai-upscaler"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        ctype = r.headers.get("Content-Type", "").lower()
+        cd = r.headers.get("Content-Disposition", "")
+        m = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)", cd)
+        name = urllib.parse.unquote(m.group(1) if m else Path(urllib.parse.urlparse(r.geturl()).path).name) or "video"
+        ext = Path(name).suffix.lower()
+        if require_video and not (ctype.startswith("video/") or ext in VIDEO_EXTS):
+            return False
+        dst = UP_DIR / f"{src['id']}{ext if ext in VIDEO_EXTS else '.mp4'}"
+        size = _copy_stream(src, r, dst, int(r.headers.get("Content-Length") or 0), "İndiriliyor")
+    src_set(src, path=str(dst), name=name, size=size)
+    return True
+
+
+def _ensure_ytdlp():
+    if importlib.util.find_spec("yt_dlp") is None or importlib.util.find_spec("yt_dlp_ejs") is None:
+        log("yt-dlp kuruluyor (YouTube ve diğer siteler için)…")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "yt-dlp[default]", "deno"], check=True)
+    deno = shutil.which("deno") or shutil.which("deno", path=str(Path(sys.executable).parent))
+    env = dict(os.environ)
+    if deno:  # YouTube için JavaScript çalışma zamanı
+        env["PATH"] = str(Path(deno).parent) + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def _download_ytdlp(src, url):
+    env = _ensure_ytdlp()
+    cmd = [sys.executable, "-m", "yt_dlp", "--no-playlist", "-f", "bv*+ba/b", "--merge-output-format", "mkv",
+           "-N", "4", "--newline", "--progress", "--progress-template",
+           "download:[dl] %(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
+           "--print", "after_move:[ok] %(title)s", "-o", str(UP_DIR / f"{src['id']}.%(ext)s"), url]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+    title, tail, last = None, [], 0.0
+    for line in p.stdout:
+        line = line.strip()
+        if line.startswith("[dl]"):
+            m = re.search(r"([\d.]+)%", line)
+            now = time.time()
+            if m and now - last > 0.5:
+                last = now
+                speed, eta = ([x.strip() for x in line[4:].split("|")] + ["", "", ""])[1:3]
+                known = lambda v: v and not any(u in v for u in ("Unknown", "NA", "N/A"))  # noqa: E731
+                src_set(src, progress=min(float(m.group(1)) / 100, 0.999),
+                        stage=f"İndiriliyor %{float(m.group(1)):.0f}" + (f" · {speed}" if known(speed) else "")
+                              + (f" · kalan {eta}" if known(eta) else ""))
+        elif line.startswith("[ok]"):
+            title = line[4:].strip()
+        elif line:
+            tail = (tail + [line])[-6:]
+    rc = p.wait()
+    files = [f for f in UP_DIR.glob(f"{src['id']}.*")
+             if f.suffix.lower() not in (".json", ".part", ".ytdl", ".tmp") and ".part" not in f.name]
+    if rc != 0 or not files:
+        detail = " | ".join(t for t in tail if "ERROR" in t or "error" in t) or (tail[-1] if tail else "")
+        raise RuntimeError(f"Link indirilemedi: {detail[-400:]}" if detail else "Link indirilemedi.")
+    f = max(files, key=lambda x: x.stat().st_size)
+    src_set(src, path=str(f), name=f"{(title or 'video')[:120]}{f.suffix}", size=f.stat().st_size)
+
+
+def import_url(src, url):
+    try:
+        ext = Path(urllib.parse.urlparse(url).path).suffix.lower()
+        ok = ext in VIDEO_EXTS and _download_direct(src, url)
+        if not ok:
+            try:
+                _download_ytdlp(src, url)
+            except Exception:
+                if not _download_direct(src, url, require_video=True):
+                    raise
+        finalize_source(src)
+    except Exception as e:  # noqa: BLE001
+        src_set(src, status="error", stage="", error=str(e)[-500:])
+        log(f"Link indirilemedi ({url}): {e}")
+
+
+def import_drive(src, path):
+    try:
+        with open(path, "rb") as fin:
+            _copy_stream(src, fin, src["path"], os.path.getsize(path), "Drive'dan kopyalanıyor")
+        finalize_source(src)
+    except Exception as e:  # noqa: BLE001
+        src_set(src, status="error", stage="", error=str(e)[-500:])
+
+
+def list_drive():
+    items, roots = [], [(DRIVE_DIR / "girdi", True), (DRIVE_ROOT, False)]
+    for root, recursive in roots:
+        if not root.is_dir():
+            continue
+        for p in (root.rglob("*") if recursive else root.iterdir()):
+            if len(items) >= 300:
+                break
+            try:
+                if p.suffix.lower() in VIDEO_EXTS and p.is_file():
+                    st = p.stat()
+                    items.append({"path": str(p.relative_to(DRIVE_ROOT)), "size": st.st_size, "mtime": st.st_mtime})
+            except OSError:
+                continue
+    return sorted(items, key=lambda i: -i["mtime"])
+
+
+# --- Önizleme (önce / sonra) -------------------------------------------------
 def pick_sr_model(model, factor):
     if model == "anime":
         return "RealESRGAN_x4plus_anime_6B"
@@ -849,9 +1136,90 @@ def pick_sr_model(model, factor):
     return "RealESRGAN_x2plus" if factor <= 2 else "RealESRGAN_x4plus"
 
 
+def make_preview(src, opts, pos):
+    info = src["info"]
+    out_w, out_h, need_ai = plan_size(info["width"], info["height"], opts["res"])
+    need_ai = need_ai or opts["enhance"]
+    name = pick_sr_model(opts["model"], min(out_w / info["width"], out_h / info["height"])) if need_ai else None
+    sr = MODELS.sr(name) if name else None
+    dw, dh = (info["width"], info["height"]) if need_ai else (out_w, out_h)
+    t = max(0.0, min(pos * info["duration"], info["duration"] - 0.1)) if info["duration"] else 0.0
+    cmd = build_decode_cmd(src["path"], info, Fraction(info["fps_num"], info["fps_den"]),
+                           None if need_ai else (out_w, out_h), start=t, frames=1)
+    raw = subprocess.run(cmd, capture_output=True, timeout=300).stdout
+    dtype = np.uint16 if info["deep"] else np.uint8
+    nbytes = dw * dh * 3 * np.dtype(dtype).itemsize
+    if len(raw) < nbytes:
+        raise RuntimeError("Bu konumdan kare okunamadı; başka bir konum deneyin.")
+    arr = np.frombuffer(raw[:nbytes], dtype).reshape(dh, dw, 3).copy()
+    t0 = time.time()
+    with torch.inference_mode():
+        x = to_tensor(arr)
+        with GPU_LOCK:
+            before = x if x.shape[-2:] == (out_h, out_w) else F.interpolate(
+                x, size=(out_h, out_w), mode="bicubic", align_corners=False, antialias=True).clamp_(0, 1)
+            after = sr_upscale(sr, x, out_w, out_h) if sr else before
+        ms = int((time.time() - t0) * 1000)
+        k = min(1.0, 1600 / max(out_w, out_h))
+        view = (lambda im: im) if k >= 1 else (lambda im: F.interpolate(
+            im, size=(_even(out_h * k), _even(out_w * k)), mode="bicubic", align_corners=False, antialias=True))
+        item = {"before": to_uint8_image(before), "after": to_uint8_image(after),
+                "full_before": to_uint8_image(view(before).clamp(0, 1)),
+                "full_after": to_uint8_image(view(after).clamp(0, 1)), "created": time.time()}
+    pid = uuid.uuid4().hex[:10]
+    with JLOCK:
+        PREVIEWS[pid] = item
+        for old in sorted(PREVIEWS, key=lambda p: PREVIEWS[p]["created"])[:-4]:
+            PREVIEWS.pop(old, None)
+    return {"id": pid, "token": dl_token(pid), "w": out_w, "h": out_h, "ai": bool(sr), "model": name, "time": t,
+            "ms": ms}
+
+
+def preview_image(pid, kind, x, y):
+    item = PREVIEWS.get(pid)
+    if item is None:
+        return None
+    if kind.startswith("full_"):
+        return encode_jpeg(item[kind])
+    img = item[kind.replace("crop_", "")]
+    h, w, _ = img.shape
+    cw, ch = (min(w, 960), min(h, 540)) if w >= h else (min(w, 540), min(h, 960))
+    x0 = int(min(max(x * w - cw / 2, 0), w - cw))
+    y0 = int(min(max(y * h - ch / 2, 0), h - ch))
+    return encode_jpeg(np.ascontiguousarray(img[y0:y0 + ch, x0:x0 + cw]))
+
+
+# =============================================================================
+#  İşleme hattı
+# =============================================================================
 def _safe_name(name):
     base = re.sub(r"[^\w\-]+", "_", Path(name).stem, flags=re.UNICODE).strip("_") or "video"
     return base[:60]
+
+
+def job_window(info, start, end):
+    """Kırpma aralığını doğrula → (başlangıç, bitiş|None)."""
+    dur = info["duration"] or 0.0
+    start = start or 0.0
+    if dur and end is not None and end >= dur:
+        end = None
+    if dur and start >= dur - 0.05:
+        raise ValueError(f"Başlangıç ({fmt_ts(start)}) videonun süresinden ({fmt_ts(dur)}) büyük.")
+    if end is not None and end <= start + 0.05:
+        raise ValueError("Bitiş zamanı başlangıçtan sonra olmalı.")
+    return start, end
+
+
+def describe(info, opts):
+    w, h, _ = plan_size(info["width"], info["height"], opts["res"])
+    ofps = info["fps"] if opts["fps"] == "orig" else int(opts["fps"])
+    parts = [f"{w}×{h} @ {ofps:g} FPS", "H.265 10-bit" if opts["codec"] == "h265" else "H.264"]
+    if opts["slow"] != "1":
+        parts.append(f"{opts['slow']}× ağır çekim")
+    if opts["start"] or opts["end"] is not None:
+        end = fmt_ts(opts["end"], True) if opts["end"] is not None else "son"
+        parts.append(f"{fmt_ts(opts['start'] or 0, True)}–{end}")
+    return " · ".join(parts)
 
 
 def process_job(job):
@@ -864,12 +1232,20 @@ def process_job(job):
     src_w, src_h = info["width"], info["height"]
     fps_in = Fraction(info["fps_num"], info["fps_den"])
     out_w, out_h, need_ai = plan_size(src_w, src_h, opt["res"])
+    enhance_only = opt.get("enhance") and not need_ai
+    need_ai = need_ai or enhance_only
     fps_out = fps_in if opt["fps"] == "orig" else Fraction(int(opt["fps"]))
-    use_rife = fps_out > fps_in * Fraction(101, 100)
-    ratio = fps_in / fps_out  # çıkış karesi k → kaynak konumu k*ratio
+    slow = int(opt.get("slow", "1"))
+    rate = fps_out * slow  # kaynak saniyesi başına üretilecek çıkış karesi
+    use_rife = rate > fps_in * Fraction(101, 100)
+    ratio = fps_in / rate  # çıkış karesi k → kaynak konumu k*ratio
     scene = use_rife and opt.get("scene", True)
     dedup = use_rife and opt.get("dedup", True)
-    total_est = max(1, round(max(1, info["frames"]) * fps_out / fps_in))
+    start, end = opt.get("start") or 0.0, opt.get("end")
+    seg = (end if end is not None else info["duration"]) - start
+    trimmed = start > 0 or end is not None
+    frames_in = max(1, round(seg * float(fps_in)) if trimmed and seg > 0 else info["frames"])
+    total_est = max(1, round(frames_in * rate / fps_in))
     job_set(job, stage="Hazırlanıyor", total=total_est, done=0)
 
     sr = None
@@ -878,7 +1254,7 @@ def process_job(job):
         name = pick_sr_model(opt["model"], min(out_w / src_w, out_h / src_h))
         job_set(job, stage=f"AI modeli yükleniyor ({name})")
         sr = MODELS.sr(name)
-        engine.append(f"Büyütme: {name} (×{sr.scale})")
+        engine.append(f"{'AI iyileştirme' if enhance_only else 'Büyütme'}: {name} (×{sr.scale})")
     elif opt["res"] == "orig":
         engine.append("Büyütme: yok (orijinal çözünürlük)")
     else:
@@ -891,6 +1267,10 @@ def process_job(job):
         engine.append("İnterpolasyon: RIFE 4.26" + (f" + {' + '.join(extras)}" if extras else ""))
     else:
         engine.append("İnterpolasyon: yok")
+    if slow > 1:
+        engine.append(f"Ağır çekim {slow}× (ses kaldırıldı)")
+    if trimmed:
+        engine.append(f"Kesit: {fmt_ts(start, True)}–{fmt_ts(start + seg, True)}")
     check()
 
     job_set(job, stage="Video kodlayıcı hazırlanıyor")
@@ -903,7 +1283,8 @@ def process_job(job):
         + " · ".join(engine))
 
     tmp_video = WORK_DIR / f"{job['id']}_video.mp4"
-    dec_cmd = build_decode_cmd(job["path"], info, fps_in, None if need_ai else (out_w, out_h))
+    dec_cmd = build_decode_cmd(job["path"], info, fps_in, None if need_ai else (out_w, out_h),
+                               start=start or None, dur=seg if end is not None else None)
     dec_w, dec_h = (src_w, src_h) if need_ai else (out_w, out_h)
     enc_cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", in_pix,
                "-s", f"{out_w}x{out_h}", "-r", frac_str(fps_out), "-i", "-", *enc_args, "-pix_fmt", out_pix,
@@ -930,14 +1311,6 @@ def process_job(job):
             job_set(job, stage="İşleniyor", done=k, progress=min(0.99, k / total), fps_proc=round(speed, 2),
                     eta=int((total - k) / speed) if speed > 0 else None)
 
-    def upscale(x):
-        if sr is None:
-            return x
-        y = sr(x.half() if HALF else x).float()
-        if y.shape[-2:] != (out_h, out_w):
-            y = F.interpolate(y, size=(out_h, out_w), mode="bicubic", align_corners=False, antialias=True)
-        return y.clamp_(0, 1)
-
     def emit_span(prev, cur, ts, cut):
         """prev→cur aralığındaki çıkış karelerini (t ∈ [0,1)) üretip kodlayıcıya gönderir."""
         for c in range(0, len(ts), 8):
@@ -955,7 +1328,8 @@ def process_job(job):
                     frames.append(None)
                     need.append(t)
             if need:
-                mids = iter(rife(prev, cur, need).split(1))
+                with GPU_LOCK:
+                    mids = iter(rife(prev, cur, need).split(1))
                 frames = [f if f is not None else next(mids) for f in frames]
             emit(torch.cat(frames))
 
@@ -977,7 +1351,11 @@ def process_job(job):
                     # karede kalır ki yavaş değişimler birikip yakalansın
                     cur, cur_st, dt = prev, prev_st, prev_dt
                 else:
-                    cur = upscale(x)
+                    if sr is not None:
+                        with GPU_LOCK:
+                            cur = sr_upscale(sr, x, out_w, out_h)
+                    else:
+                        cur = x
                     cur_st = _scene_thumb(x) if scene else None
                     if scene and prev is not None and _ssim(prev_st, cur_st) < 0.2:
                         cut = True
@@ -994,7 +1372,7 @@ def process_job(job):
                 prev, prev_dt, prev_st, pj = cur, dt, cur_st, j
             if prev is None:
                 raise RuntimeError("Videodan hiç kare okunamadı.")
-            total = max(1, round((j + 1) * fps_out / fps_in))
+            total = max(1, round((j + 1) * rate / fps_in))
             job_set(job, total=total)
             while k < total:  # son kare(ler) — süre kaynakla aynı kalsın
                 n = min(8, total - k)
@@ -1012,30 +1390,34 @@ def process_job(job):
 
     check()
     job_set(job, stage="Ses ekleniyor ve dosya hazırlanıyor", progress=0.995, eta=None)
+    tag = (f"_{opt['slow']}x_agir" if slow > 1 else "") + ("_kesit" if trimmed else "")
     out_name = (f"{_safe_name(job['name'])}_{RES_LABELS[opt['res']]}_"
-                f"{'orjfps' if opt['fps'] == 'orig' else opt['fps'] + 'fps'}_{job['id'][:4]}.mp4")
+                f"{'orjfps' if opt['fps'] == 'orig' else opt['fps'] + 'fps'}{tag}_{job['id'][:4]}.mp4")
     final = OUT_DIR / out_name
-    base_cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-y", "-i", str(tmp_video)]
-    ok = False
-    if info["has_audio"]:
-        audio_in = ["-i", str(job["path"]), "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy"]
-        tail = ["-movflags", "+faststart", str(final)]
-        attempts = []
-        if info["audio_trim"] <= 0.005 and info["acodec"] in ("aac", "mp3", "ac3", "eac3", "alac"):
-            attempts.append(["-c:a", "copy"])  # orijinal ses, kayıpsız
-        af = ["-af", f"atrim=start={info['audio_trim']:.4f},asetpts=PTS-STARTPTS"] if info["audio_trim"] > 0.005 else []
-        attempts.append(["-c:a", "aac", "-b:a", "320k", *af])
-        for a in attempts:
-            r = run(base_cmd + audio_in + a + tail)
-            if r.returncode == 0:
-                ok = True
-                break
-        if not ok:
-            log(f"[{job['id']}] Ses eklenemedi, sessiz kaydediliyor: {r.stderr[-300:]}")
-    if not ok:
-        r = run(base_cmd + ["-c", "copy", "-movflags", "+faststart", str(final)])
-        if r.returncode != 0:
-            raise RuntimeError("Çıktı dosyası yazılamadı: " + r.stderr[-400:])
+    # Kaynak, meta veriler (çekim tarihi vb.) ve ses için ikinci girdi; kırpmada aynı aralık alınır.
+    src_in = (["-ss", f"{start:.3f}"] if start else []) + (["-t", f"{seg:.3f}"] if end is not None else [])
+    base = ["ffmpeg", "-hide_banner", "-v", "error", "-y", "-i", str(tmp_video), *src_in, "-i", str(job["path"]),
+            "-map", "0:v:0", "-map_metadata", "1", "-c:v", "copy"]
+    tail = ["-movflags", "+faststart", str(final)]
+    attempts = []
+    if info["has_audio"] and slow == 1:
+        audio = ["-map", "1:a:0"]
+        if info["audio_trim"] <= 0.005 or trimmed:
+            if info["acodec"] in ("aac", "mp3", "ac3", "eac3", "alac"):
+                attempts.append(audio + ["-c:a", "copy"])  # orijinal ses, kayıpsız
+            attempts.append(audio + ["-c:a", "aac", "-b:a", "320k"])
+        else:
+            attempts.append(audio + ["-c:a", "aac", "-b:a", "320k", "-af",
+                                     f"atrim=start={info['audio_trim']:.4f},asetpts=PTS-STARTPTS"])
+    attempts.append([])  # sessiz yedek
+    for i, a in enumerate(attempts):
+        r = run(base + a + tail)
+        if r.returncode == 0:
+            if a == [] and len(attempts) > 1:
+                log(f"[{job['id']}] Ses eklenemedi, sessiz kaydedildi.")
+            break
+    else:
+        raise RuntimeError("Çıktı dosyası yazılamadı: " + r.stderr[-400:])
     tmp_video.unlink(missing_ok=True)
 
     drive_path = None
@@ -1049,7 +1431,21 @@ def process_job(job):
     job_set(job, status="done", stage="Tamamlandı", progress=1.0, eta=None, finished=time.time(),
             out_name=out_name, out_path=str(final), out_size=final.stat().st_size, drive=drive_path,
             done=st["k"], total=st["k"], fps_proc=round(st["k"] / max(el, 1e-6), 2))
+    save_json(OUT_DIR / f"{out_name}.json", {**{k: job.get(k) for k in JOB_KEYS}, "info": info, "path": job["path"]})
     log(f"[{job['id']}] ✅ Bitti ({el / 60:.1f} dk): {final}")
+
+
+def new_job(src, opts):
+    jid = uuid.uuid4().hex[:10]
+    i = src["info"]
+    job = {"id": jid, "name": src["name"], "source_id": src["id"], "path": src["path"], "info": dict(i),
+           "opts": dict(opts), "status": "queued", "stage": "Sırada bekliyor", "progress": 0.0, "created": time.time(),
+           "engine": [], "in_desc": f"{i['width']}×{i['height']} @ {i['fps']:g} FPS · {fmt_ts(i['duration'])}",
+           "out_desc": describe(i, opts)}
+    registry_put(JOBS, jid, job)
+    JOBQ.put(jid)
+    log(f"[{jid}] Kuyruğa eklendi: {src['name']} → {job['out_desc']}")
+    return job
 
 
 def worker_loop(stop_event):
@@ -1076,6 +1472,37 @@ def worker_loop(stop_event):
                 torch.cuda.empty_cache()
 
 
+def restore_state():
+    """Hücre yeniden çalıştırıldığında önceki videoları ve biten işleri geri yükle."""
+    keep = set()
+    for f in UP_DIR.glob("*.json"):
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+            if not Path(d["path"]).exists():
+                f.unlink()
+                continue
+            thumb = UP_DIR / f"{d['id']}_thumb.jpg"
+            SOURCES[d["id"]] = {**d, "status": "ready", "stage": "", "progress": 1.0, "error": None,
+                                "thumb": thumb.exists()}
+            keep |= {f.name, Path(d["path"]).name, thumb.name}
+        except Exception:  # noqa: BLE001
+            continue
+    for f in UP_DIR.iterdir():  # yarım kalmış yüklemeleri temizle
+        if f.is_file() and f.name not in keep:
+            f.unlink(missing_ok=True)
+    for f in OUT_DIR.glob("*.json"):
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+            out = OUT_DIR / d["out_name"]
+            if not out.exists():
+                f.unlink()
+                continue
+            JOBS[d["id"]] = {**d, "status": "done", "out_path": str(out)}
+        except Exception:  # noqa: BLE001
+            continue
+    return len(SOURCES), len(JOBS)
+
+
 # =============================================================================
 #  Web arayüzü (FastAPI)
 # =============================================================================
@@ -1091,33 +1518,50 @@ PAGE_HTML = r"""<!doctype html>
 *{box-sizing:border-box}
 html,body{margin:0}
 body{background:radial-gradient(1100px 560px at 0% -10%,#22185099 0,transparent 60%),radial-gradient(900px 480px at 110% -5%,#0c3a4a88 0,transparent 55%),var(--bg);color:var(--text);font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,Ubuntu,sans-serif;min-height:100vh}
-.wrap{max-width:980px;margin:0 auto;padding:26px 16px 70px}
+.wrap{max-width:1000px;margin:0 auto;padding:26px 16px 70px}
 header{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:22px}
 .brand{display:flex;align-items:center;gap:13px}
 .mark{width:46px;height:46px;border-radius:14px;background:linear-gradient(135deg,var(--acc),var(--acc2));display:grid;place-items:center;font-size:22px;box-shadow:0 8px 30px #7c5cff55}
 h1{font-size:21px;margin:0;letter-spacing:.2px}
 .sub{color:var(--muted);font-size:13px}
+.chips{display:flex;gap:8px;flex-wrap:wrap}
 .chip{display:inline-flex;align-items:center;gap:7px;padding:7px 12px;border-radius:99px;background:var(--card);border:1px solid var(--line);font-size:13px;color:var(--muted)}
 .chip b{color:var(--text);font-weight:600}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 10px var(--ok)}
 .dot.warn{background:var(--warn);box-shadow:0 0 10px var(--warn)}
 .card{background:linear-gradient(180deg,#141a29,#111623);border:1px solid var(--line);border-radius:18px;padding:20px;margin-bottom:18px}
 .card h2{font-size:16px;margin:0 0 15px;display:flex;align-items:center;gap:10px}
-.num{width:26px;height:26px;border-radius:50%;display:grid;place-items:center;font-size:13px;font-weight:700;background:linear-gradient(135deg,var(--acc),var(--acc2))}
-.drop{border:2px dashed var(--line);border-radius:15px;padding:34px 16px;text-align:center;cursor:pointer;transition:.18s;background:#0e1320}
+.num{width:26px;height:26px;border-radius:50%;display:grid;place-items:center;font-size:13px;font-weight:700;background:linear-gradient(135deg,var(--acc),var(--acc2));flex:none}
+.drop{border:2px dashed var(--line);border-radius:15px;padding:26px 16px;text-align:center;cursor:pointer;transition:.18s;background:#0e1320}
 .drop:hover,.drop.over{border-color:var(--acc);background:#7c5cff12}
-.drop .big{font-size:38px;line-height:1;margin-bottom:8px}
+.drop .big{font-size:34px;line-height:1;margin-bottom:8px}
 .drop strong{display:block;font-size:16px;margin-bottom:4px}
 .drop span{color:var(--muted);font-size:13px}
-.file{display:none;margin-top:14px;padding:14px;border-radius:13px;background:var(--card2);border:1px solid var(--line)}
-.file .row{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center}
-.fname{font-weight:600;word-break:break-all}
+.addrow{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+.addrow input{flex:1;min-width:220px}
+input[type=text]{background:#0b0f1a;border:1px solid var(--line);color:var(--text);border-radius:11px;padding:10px 12px;font:inherit;width:100%}
+input[type=text]:focus{outline:2px solid var(--acc);outline-offset:1px}
+.drivepanel{margin-top:10px;padding:12px;border-radius:12px;background:#0b0f1a;border:1px solid var(--line);max-height:300px;overflow:auto}
+.drow{display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid #1c2438}
+.drow:last-child{border-bottom:0}
+.drow .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px}
+.upstat{margin-top:10px;font-size:13px;color:var(--muted);min-height:1em}
+.src{display:flex;gap:12px;align-items:center;padding:10px;border:1px solid var(--line);border-radius:13px;background:var(--card2);margin-top:10px;transition:.15s}
+.src.sel{border-color:var(--acc);box-shadow:inset 0 0 0 1px var(--acc)}
+.src .th{width:104px;height:58px;border-radius:9px;object-fit:cover;background:#0b0f1a;flex:none;display:grid;place-items:center;font-size:22px}
+.src .meta{flex:1;min-width:0}
+.src .nm{font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.src input[type=checkbox]{width:19px;height:19px;accent-color:var(--acc);flex:none;cursor:pointer}
+.srcbar{display:flex;align-items:center;gap:14px;margin-top:12px;font-size:13px;color:var(--muted)}
+.srcbar span{flex:1}
+.linkbtn{background:none;border:0;color:var(--acc2);font:inherit;font-size:13px;cursor:pointer;padding:0}
+.iconbtn{background:none;border:1px solid var(--line);color:var(--muted);border-radius:9px;padding:7px 10px;cursor:pointer;flex:none}
+.iconbtn:hover{color:var(--text);border-color:#3a4766}
 .muted{color:var(--muted);font-size:13px}
-.bar{height:8px;background:#0b0f1a;border-radius:99px;overflow:hidden;margin-top:10px}
+.bar{height:8px;background:#0b0f1a;border-radius:99px;overflow:hidden;margin-top:8px}
 .bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--acc),var(--acc2));transition:width .35s}
-.pills{display:flex;flex-wrap:wrap;gap:7px;margin-top:10px}
-.pill{padding:4px 10px;border-radius:99px;background:#0b0f1a;border:1px solid var(--line);font-size:12.5px;color:var(--muted)}
-.pill b{color:var(--text);font-weight:600}
+.pills{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+.pill{padding:3px 9px;border-radius:99px;background:#0b0f1a;border:1px solid var(--line);font-size:12px;color:var(--muted)}
 .group{margin-bottom:17px}
 .group .t{font-size:13px;color:var(--muted);margin-bottom:8px;font-weight:600;letter-spacing:.3px;text-transform:uppercase}
 .seg{display:grid;grid-template-columns:repeat(auto-fit,minmax(138px,1fr));gap:8px}
@@ -1127,33 +1571,53 @@ h1{font-size:21px;margin:0;letter-spacing:.2px}
 .seg label small{display:block;font-weight:400;color:var(--muted);font-size:12px;margin-top:1px}
 .seg input:checked+label{border-color:var(--acc);background:linear-gradient(135deg,#7c5cff2e,#20d3ee14);box-shadow:inset 0 0 0 1px var(--acc)}
 .seg input:focus-visible+label{outline:2px solid var(--acc2);outline-offset:2px}
-.toggles{display:flex;flex-direction:column;gap:9px;margin-bottom:4px}
+.toggles{display:flex;flex-direction:column;gap:9px;margin-bottom:6px}
 .toggle{display:flex;align-items:center;gap:10px;cursor:pointer;font-size:14px;user-select:none}
 .toggle input{width:18px;height:18px;accent-color:var(--acc);flex:none}
-.summary{margin:14px 0 16px;padding:12px 14px;border-radius:12px;background:#0b0f1a;border:1px solid var(--line);font-size:14px}
-.summary .arrow{color:var(--acc2);font-weight:700;margin:0 6px}
+.trim{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0 4px}
+.trim label{display:block;font-size:12.5px;color:var(--muted);margin-bottom:5px}
+.summary{margin:14px 0 16px;padding:12px 14px;border-radius:12px;background:#0b0f1a;border:1px solid var(--line);font-size:14px;line-height:1.6}
+.summary > div + div{margin-top:2px}
 .note{font-size:12.5px;color:var(--warn);margin-top:6px}
-.btn{appearance:none;border:0;border-radius:13px;padding:13px 20px;font-weight:700;font-size:15px;cursor:pointer;color:#fff;background:linear-gradient(135deg,var(--acc),#5b8cff 60%,var(--acc2));box-shadow:0 10px 30px #7c5cff44;transition:.15s;width:100%}
+.btn{appearance:none;border:0;border-radius:13px;padding:13px 20px;font-weight:700;font-size:15px;cursor:pointer;color:#fff;background:linear-gradient(135deg,var(--acc),#5b8cff 60%,var(--acc2));box-shadow:0 10px 30px #7c5cff44;transition:.15s;width:100%;font-family:inherit}
 .btn:hover{filter:brightness(1.08)}
 .btn:disabled{opacity:.45;cursor:not-allowed;box-shadow:none}
-.btn.sm{width:auto;padding:8px 13px;font-size:13px;border-radius:10px;box-shadow:none}
+.btn.sm{width:auto;padding:9px 14px;font-size:13.5px;border-radius:10px;box-shadow:none}
+.btn.ghost{background:var(--card2);border:1px solid var(--line);color:var(--text);box-shadow:none}
 .btn.red{background:#3a1720;border:1px solid #6b2433;color:#ffb4c0}
-.jobs-empty{color:var(--muted);text-align:center;padding:22px 10px;font-size:14px}
+.btnrow{display:grid;grid-template-columns:1fr 2fr;gap:10px}
+.empty{color:var(--muted);text-align:center;padding:18px 10px;font-size:14px}
 .job{border:1px solid var(--line);border-radius:15px;padding:15px;margin-top:11px;background:var(--card2)}
 .job .top{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap}
 .job .title{font-weight:650;word-break:break-all}
 .badge{font-size:12px;font-weight:700;padding:4px 10px;border-radius:99px;white-space:nowrap}
 .b-queued{background:#2a2f45;color:#c6cde0}.b-running{background:#1d2c55;color:#9cc0ff}.b-done{background:#123222;color:#7ff0a8}.b-error{background:#3a1720;color:#ffb4c0}.b-canceled{background:#2a2a2a;color:#bbb}
+.b-uploading,.b-downloading,.b-processing{background:#1d2c55;color:#9cc0ff}
 .job .stats{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-top:8px;font-size:13px;color:var(--muted)}
 .job .eng{margin-top:8px;font-size:12.5px;color:var(--muted)}
-.job .acts{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px}
-.job .acts a.alt{color:var(--muted);font-size:12.5px}
-.job .errm{margin-top:8px;font-size:13px;color:#ffb4c0;white-space:pre-wrap;word-break:break-word}
+.acts{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px}
+.acts a.alt{color:var(--muted);font-size:12.5px}
+.errm{margin-top:6px;font-size:13px;color:#ffb4c0;white-space:pre-wrap;word-break:break-word}
 a.btn{text-decoration:none;display:inline-block;text-align:center}
+.cmp{position:relative;border-radius:12px;overflow:hidden;background:#000;user-select:none;touch-action:none;cursor:ew-resize;line-height:0}
+.cmp img{display:block;width:100%;height:auto;pointer-events:none}
+.cmp img.over{position:absolute;inset:0;height:100%;clip-path:inset(0 50% 0 0)}
+.cmp .hd{position:absolute;top:0;bottom:0;left:50%;width:2px;background:#fff;box-shadow:0 0 8px #000c;pointer-events:none}
+.cmp .hd::after{content:"⇆";position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);background:#fff;color:#111;border-radius:50%;width:32px;height:32px;display:grid;place-items:center;font-size:16px;line-height:1}
+.cmp .tag{position:absolute;top:10px;padding:4px 10px;border-radius:99px;background:#000b;font-size:12px;line-height:1.4;pointer-events:none}
+.cmp .tag.l{left:10px}.cmp .tag.r{right:10px}
+.cmp .loading{position:absolute;inset:0;display:none;place-items:center;background:#0008;font-size:14px;line-height:1.4}
+.cmp.busy .loading{display:grid}
+.pvbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:12px}
+.pvbar label{display:flex;align-items:center;gap:8px;flex:1;min-width:200px}
+.pvbar input[type=range]{flex:1;accent-color:var(--acc)}
+.seg2{display:inline-flex;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.seg2 button{background:var(--card2);color:var(--muted);border:0;padding:8px 12px;font:inherit;font-size:13px;cursor:pointer}
+.seg2 button.on{background:linear-gradient(135deg,#7c5cff55,#20d3ee33);color:var(--text)}
 .toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%) translateY(30px);opacity:0;background:#1d2440;border:1px solid var(--line);padding:11px 16px;border-radius:12px;font-size:14px;transition:.25s;z-index:9;max-width:calc(100% - 32px)}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 footer{color:var(--muted);font-size:12.5px;text-align:center;margin-top:26px;line-height:1.7}
-@media (max-width:560px){.seg{grid-template-columns:repeat(2,1fr)}h1{font-size:19px}.card{padding:16px}}
+@media (max-width:560px){.seg{grid-template-columns:repeat(2,1fr)}h1{font-size:19px}.card{padding:16px}.src{gap:9px}.src .th{width:64px;height:40px}.src .pill:nth-child(n+4){display:none}.btnrow{grid-template-columns:1fr}.trim{grid-template-columns:1fr 1fr}}
 </style>
 </head>
 <body>
@@ -1163,22 +1627,29 @@ footer{color:var(--muted);font-size:12.5px;text-align:center;margin-top:26px;lin
       <div class="mark">🎬</div>
       <div><h1>AI Video Upscaler</h1><div class="sub">Real-ESRGAN büyütme · RIFE 4.26 kare interpolasyonu</div></div>
     </div>
-    <div class="chip" id="gpuChip"><span class="dot" id="gpuDot"></span><span id="gpuTxt">Bağlanıyor…</span></div>
+    <div class="chips">
+      <div class="chip"><span class="dot" id="gpuDot"></span><span id="gpuTxt">Bağlanıyor…</span></div>
+      <div class="chip" id="diskChip" hidden></div>
+    </div>
   </header>
 
   <section class="card">
-    <h2><span class="num">1</span>Video yükle</h2>
+    <h2><span class="num">1</span>Videolar</h2>
     <div class="drop" id="drop" tabindex="0" role="button" aria-label="Video seç">
       <div class="big">⬆️</div>
-      <strong>Videoyu buraya sürükleyin veya tıklayın</strong>
-      <span>MP4, MOV, MKV, WEBM, AVI… · Boyut sınırı yok</span>
-      <input type="file" id="fileIn" accept="video/*,.mkv,.mov,.avi,.webm,.flv,.ts,.m4v,.wmv" hidden>
+      <strong>Videoları buraya sürükleyin veya tıklayın</strong>
+      <span>Birden fazla dosya seçebilirsiniz · MP4, MOV, MKV, WEBM, AVI… · boyut sınırı yok</span>
+      <input type="file" id="fileIn" accept="video/*,.mkv,.mov,.avi,.webm,.flv,.ts,.m4v,.wmv,.mts,.m2ts" multiple hidden>
     </div>
-    <div class="file" id="fileBox">
-      <div class="row"><div class="fname" id="fName"></div><div class="muted" id="fStat"></div></div>
-      <div class="bar"><i id="fBar"></i></div>
-      <div class="pills" id="fInfo"></div>
+    <div class="addrow">
+      <input type="text" id="urlIn" placeholder="…veya link yapıştırın: YouTube, Google Drive, doğrudan video linki" aria-label="Video linki">
+      <button class="btn sm" id="urlBtn">🔗 Linkten ekle</button>
+      <button class="btn sm ghost" id="driveBtn" hidden>📁 Drive'dan seç</button>
     </div>
+    <div class="drivepanel" id="drivePanel" hidden></div>
+    <div class="upstat" id="upStat"></div>
+    <div class="srcbar" id="srcBar" hidden><span id="srcCount"></span><button class="linkbtn" id="selAll">Tümünü seç</button><button class="linkbtn" id="selNone">Seçimi kaldır</button></div>
+    <div id="srcList"></div>
   </section>
 
   <section class="card">
@@ -1187,14 +1658,39 @@ footer{color:var(--muted);font-size:12.5px;text-align:center;margin-top:26px;lin
     <div class="toggles">
       <label class="toggle"><input type="checkbox" id="scene" checked> Sahne geçişlerinde bulanık ara kare oluşturma</label>
       <label class="toggle"><input type="checkbox" id="dedup" checked> Tekrarlanan (kopya) kareleri ayıkla — anime ve takılan videolarda çok daha akıcı</label>
+      <label class="toggle"><input type="checkbox" id="enhance"> Kaynak zaten hedef boyuttaysa da AI uygula (netleştirme / gürültü temizleme)</label>
     </div>
-    <div class="summary" id="summary">Önce bir video yükleyin.</div>
-    <button class="btn" id="startBtn" disabled>🚀 İşlemi Başlat</button>
+    <div class="trim">
+      <div><label for="tStart">Başlangıç (isteğe bağlı)</label><input type="text" id="tStart" placeholder="0:00" inputmode="decimal"></div>
+      <div><label for="tEnd">Bitiş (isteğe bağlı)</label><input type="text" id="tEnd" placeholder="son" inputmode="decimal"></div>
+    </div>
+    <div class="summary" id="summary">Önce bir video ekleyin.</div>
+    <div class="btnrow">
+      <button class="btn ghost" id="pvBtn" disabled>👁️ Önizleme</button>
+      <button class="btn" id="startBtn" disabled>🚀 İşlemi Başlat</button>
+    </div>
+  </section>
+
+  <section class="card" id="pvCard" hidden>
+    <h2><span class="num">👁</span>Önizleme — önce / sonra</h2>
+    <div class="cmp" id="cmp">
+      <img id="cmpA" alt="Sonra">
+      <img id="cmpB" class="over" alt="Önce">
+      <div class="hd" id="cmpH"></div>
+      <span class="tag l" id="tagL">Önce</span><span class="tag r" id="tagR">Sonra</span>
+      <div class="loading">⏳ Hazırlanıyor…</div>
+    </div>
+    <div class="pvbar">
+      <div class="seg2"><button id="pvFull" class="on">Tam kare</button><button id="pvCrop">%100 detay</button></div>
+      <label class="muted">Kare konumu <input type="range" id="pvPos" min="0" max="100" value="35"></label>
+      <button class="btn sm ghost" id="pvRefresh">↻ Yenile</button>
+    </div>
+    <div class="muted" id="pvInfo" style="margin-top:8px"></div>
   </section>
 
   <section class="card">
     <h2><span class="num">3</span>İşler ve indirmeler</h2>
-    <div id="jobs"><div class="jobs-empty">Henüz iş yok.</div></div>
+    <div id="jobs"><div class="empty">Henüz iş yok.</div></div>
   </section>
 
   <footer>
@@ -1207,20 +1703,27 @@ footer{color:var(--muted);font-size:12.5px;text-align:center;margin-top:26px;lin
 const OPTS = {
   res: {t:"Çözünürlük", items:[["orig","Orijinal","çözünürlüğü koru"],["1080","1080p","Full HD"],["1440","2K","1440p"],["2160","4K","2160p · Ultra HD"]]},
   fps: {t:"Kare hızı (interpolasyon)", items:[["orig","Orijinal","değiştirme"],["60","60 FPS","akıcı"],["90","90 FPS","çok akıcı"],["120","120 FPS","ultra akıcı"]]},
+  slow: {t:"Ağır çekim", items:[["1","Kapalı","normal hız"],["2","2× ağır","yarı hız"],["4","4× ağır","çeyrek hız"],["8","8× ağır","süper ağır"]]},
   model: {t:"AI modeli", items:[["kalite","💎 Maks. kalite","RealESRGAN x4plus · önerilen"],["hizli","⚡ Hızlı","uzun videolar için"],["anime","🎨 Anime","çizgi film / animasyon"]]},
   codec: {t:"Video formatı", items:[["h265","H.265 10-bit","en iyi kalite · bantlanma yok"],["h264","H.264","her cihazda oynar"]]},
   quality: {t:"Dosya kalitesi", items:[["maksimum","Maksimum","görsel olarak kayıpsız"],["yuksek","Yüksek","daha küçük dosya"],["dengeli","Dengeli","paylaşım için"]]},
 };
-const DEF = {res:"2160", fps:"60", model:"kalite", codec:"h265", quality:"maksimum"};
+const DEF = {res:"2160", fps:"60", slow:"1", model:"kalite", codec:"h265", quality:"maksimum"};
 const RES = {orig:null, "1080":1080, "1440":1440, "2160":2160};
 const STATUS = {queued:"Sırada", running:"İşleniyor", done:"Tamamlandı", error:"Hata", canceled:"İptal edildi"};
+const SRC_STATUS = {uploading:"Yükleniyor", downloading:"İndiriliyor", processing:"İnceleniyor", error:"Hata"};
 const $ = id => document.getElementById(id);
-let upload = null, uploading = false, dlBase = null;
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const S = {sources:[], jobs:[], dlBase:null, drive:false};
+let selected = new Set(load("v3_sel", [])), known = null, lastStatus = null;
 
-function store(k, v){ try{ if(v===undefined) return localStorage.getItem(k); localStorage.setItem(k, v); }catch(e){ return null; } }
-function toast(msg){ const t=$("toast"); t.textContent=msg; t.classList.add("show"); clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove("show"),3500); }
+function load(k, d){ try{ const v = localStorage.getItem(k); return v===null ? d : JSON.parse(v); }catch(e){ return d; } }
+function save(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
+function toast(msg){ const t=$("toast"); t.textContent=msg; t.classList.add("show"); clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove("show"),4000); }
 function fmtBytes(b){ if(!b && b!==0) return ""; const u=["B","KB","MB","GB","TB"]; let i=0; while(b>=1024&&i<4){b/=1024;i++;} return b.toFixed(i?1:0)+" "+u[i]; }
 function fmtTime(s){ if(s==null||!isFinite(s)) return "—"; s=Math.max(0,Math.round(s)); const h=Math.floor(s/3600), m=Math.floor(s%3600/60), x=s%60; return h? `${h} sa ${m} dk` : m? `${m} dk ${x} sn` : `${x} sn`; }
+function fmtClock(s){ s=Math.max(0,Math.round(s||0)); const h=Math.floor(s/3600), m=Math.floor(s%3600/60), x=s%60; return (h?h+":"+String(m).padStart(2,"0"):m)+":"+String(x).padStart(2,"0"); }
+function parseTime(v){ v=(v||"").trim().replace(",","."); if(!v) return null; const p=v.split(":"); if(p.length>3) throw 0; let s=0; for(const x of p){ if(x===""||isNaN(+x)) throw 0; s=s*60+(+x); } if(s<0) throw 0; return s; }
 function ev(v){ v=Math.round(v); return Math.max(2, v - v%2); }
 function plan(w,h,res){ const t=RES[res]; if(!t) return [ev(w),ev(h),false]; const k=t/Math.min(w,h); return [ev(w*k),ev(h*k),k>1.0001]; }
 function val(name){ const el=document.querySelector(`input[name=${name}]:checked`); return el?el.value:DEF[name]; }
@@ -1231,11 +1734,27 @@ async function api(url, opt={}){
   if(!r.ok) throw new Error((d&&d.detail)||("HTTP "+r.status));
   return d;
 }
+const post = (url, body) => api(url, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body||{})});
+
+function renderKeyed(box, items, key, html, emptyHtml){
+  if(!items.length){ if(box._empty!==true){ box.innerHTML = emptyHtml; box._empty = true; box._map = new Map(); } return; }
+  if(box._empty!==false){ box.innerHTML = ""; box._empty = false; box._map = new Map(); }
+  const map = box._map, seen = new Set();
+  items.forEach((it, i) => {
+    const k = key(it); seen.add(k);
+    let el = map.get(k);
+    if(!el){ el = document.createElement("div"); map.set(k, el); }
+    const h = html(it);
+    if(el._h !== h){ el.innerHTML = h; el._h = h; }
+    if(box.children[i] !== el) box.insertBefore(el, box.children[i] || null);
+  });
+  for(const [k, el] of map) if(!seen.has(k)){ el.remove(); map.delete(k); }
+}
 
 function buildOpts(){
   const box=$("opts");
   for(const [name,g] of Object.entries(OPTS)){
-    const saved=store("v2_"+name);
+    const saved=load("v3_"+name, null);
     const grp=document.createElement("div"); grp.className="group";
     const t=document.createElement("div"); t.className="t"; t.textContent=g.t; grp.appendChild(t);
     const seg=document.createElement("div"); seg.className="seg";
@@ -1243,154 +1762,284 @@ function buildOpts(){
       const id=`o_${name}_${v}`;
       const inp=document.createElement("input"); inp.type="radio"; inp.name=name; inp.value=v; inp.id=id;
       inp.checked = (saved||DEF[name])===v;
-      inp.onchange=()=>{ store("v2_"+name, v); updateSummary(); };
+      inp.onchange=()=>{ save("v3_"+name, v); updateSummary(); };
       const lab=document.createElement("label"); lab.htmlFor=id; lab.textContent=l;
       const sm=document.createElement("small"); sm.textContent=s; lab.appendChild(sm);
       seg.append(inp,lab);
     }
     grp.appendChild(seg); box.appendChild(grp);
   }
-  for(const id of ["scene","dedup"]){
-    const s=store("v2_"+id); if(s!==null) $(id).checked = s==="1";
-    $(id).onchange=()=>store("v2_"+id, $(id).checked?"1":"0");
+  for(const id of ["scene","dedup","enhance"]){
+    const s=load("v3_"+id, null); if(s!==null) $(id).checked = !!s;
+    $(id).onchange=()=>{ save("v3_"+id, $(id).checked); updateSummary(); };
   }
+  for(const id of ["tStart","tEnd"]) $(id).oninput=updateSummary;
 }
 
-function updateSummary(){
-  const s=$("summary");
-  if(!upload||!upload.info){ s.textContent = uploading ? "Video yükleniyor…" : "Önce bir video yükleyin."; $("startBtn").disabled=true; return; }
-  const i=upload.info, res=val("res"), fps=val("fps"), model=val("model");
-  const [w,h,ai]=plan(i.width,i.height,res);
-  const ofps = fps==="orig" ? i.fps : +fps;
-  const frames = Math.max(1, Math.round((i.frames||1) * ofps / i.fps));
-  s.innerHTML="";
-  const a=document.createElement("b"); a.textContent=`${i.width}×${i.height} @ ${i.fps} FPS`;
-  const ar=document.createElement("span"); ar.className="arrow"; ar.textContent="→";
-  const b=document.createElement("b"); b.textContent=`${w}×${h} @ ${+(+ofps).toFixed(2)} FPS`;
-  const c=document.createElement("div"); c.className="muted";
-  const parts=[];
-  parts.push(ai ? "AI ile büyütülecek" : (res==="orig"||(w===i.width&&h===i.height) ? "çözünürlük aynı kalacak" : "kaynak zaten hedeften büyük: yalnızca boyutlandırılacak"));
-  parts.push(ofps>i.fps*1.01 ? `RIFE 4.26 ile ${Math.round(ofps/i.fps*10)/10}× ara kare` : "interpolasyon yok");
-  parts.push(`≈ ${frames.toLocaleString("tr-TR")} kare`);
-  c.textContent=parts.join(" · ");
-  s.append(a,ar,b,c);
-  if(ofps<i.fps*0.99){ const n=document.createElement("div"); n.className="note"; n.textContent="Seçilen FPS kaynaktan düşük: bazı kareler atlanacak."; s.appendChild(n); }
-  if(val("codec")==="h265"){ const n=document.createElement("div"); n.className="muted"; n.style.marginTop="6px"; n.textContent="ℹ️ H.265 10-bit: telefon, TV, VLC ve modern tarayıcılarda oynar. Eski cihazlar için H.264 seçin."; s.appendChild(n); }
-  $("startBtn").disabled=false;
+// ---------- videolar ----------
+function srcHtml(s){
+  const ready = s.status==="ready", sel = ready && selected.has(s.id), i = s.info || {};
+  const pills = ready ? [`${i.width}×${i.height}`, `${i.fps} FPS`, fmtClock(i.duration), (i.codec||"")+(i.bits>8?` ${i.bits}-bit`:""), i.has_audio?"🔊 "+(i.acodec||"ses"):"🔇 sessiz"].concat(i.hdr?["HDR"]:[]) : [];
+  let status = "";
+  if(s.status==="error") status = `<div class="errm">${esc(s.error||"Hata")}</div>`;
+  else if(!ready) status = `<div class="bar"><i style="width:${((s.progress||0)*100).toFixed(1)}%"></i></div><div class="muted">${esc(SRC_STATUS[s.status]||s.status)}${s.stage?" · "+esc(s.stage):""}</div>`;
+  const thumb = s.thumb ? `<img class="th" src="/api/sources/${s.id}/thumb" alt="" loading="lazy">` : `<div class="th">${s.status==="error"?"⚠️":ready?"🎞️":"⏳"}</div>`;
+  const origin = {url:"🔗 ", drive:"📁 "}[s.origin] || "";
+  return `<div class="src${sel?" sel":""}">
+    <input type="checkbox" data-act="sel" data-id="${s.id}" ${sel?"checked":""} ${ready?"":"disabled"} aria-label="Seç">
+    ${thumb}
+    <div class="meta"><div class="nm" title="${esc(s.name)}">${origin}${esc(s.name)}</div>
+      <div class="pills">${pills.map(p=>`<span class="pill">${esc(p)}</span>`).join("")}${ready&&s.size?`<span class="pill">${fmtBytes(s.size)}</span>`:""}</div>${status}</div>
+    <button class="iconbtn" data-act="src-del" data-id="${s.id}" title="Listeden kaldır ve sil">🗑</button></div>`;
 }
+function renderSources(){
+  renderKeyed($("srcList"), S.sources, s=>s.id, srcHtml, "");
+  const ready = S.sources.filter(s=>s.status==="ready").length;
+  $("srcBar").hidden = ready < 2;
+  $("srcCount").textContent = `${S.sources.length} video · ${selReady().length} seçili`;
+}
+function selectAll(on){
+  for(const s of S.sources) if(s.status==="ready"){ if(on) selected.add(s.id); else selected.delete(s.id); }
+  save("v3_sel", [...selected]); renderSources(); updateSummary();
+}
+function selReady(){ return S.sources.filter(s => s.status==="ready" && selected.has(s.id)); }
 
-async function uploadFile(file){
-  if(uploading) return toast("Bir yükleme zaten sürüyor.");
-  uploading=true; upload=null; updateSummary();
-  $("fileBox").style.display="block"; $("fName").textContent=file.name; $("fInfo").innerHTML=""; $("fBar").style.width="0%";
-  $("fStat").textContent="Hazırlanıyor…";
-  try{
-    const init=await api("/api/upload/init",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:file.name,size:file.size})});
-    const CH=init.chunk_size, total=init.chunks; let next=0, sent=0; const t0=performance.now();
-    const showProg=()=>{ const p=sent/file.size, el=(performance.now()-t0)/1000, sp=sent/Math.max(el,.001);
-      $("fBar").style.width=(p*100).toFixed(1)+"%";
-      $("fStat").textContent=`%${(p*100).toFixed(0)} · ${fmtBytes(sent)} / ${fmtBytes(file.size)} · ${fmtBytes(sp)}/sn · kalan ${fmtTime((file.size-sent)/Math.max(sp,1))}`; };
-    async function worker(){
-      while(true){
-        const i=next++; if(i>=total) return;
-        const blob=file.slice(i*CH, Math.min(file.size,(i+1)*CH));
-        for(let a=0;;a++){
-          try{ const r=await fetch(`/api/upload/${init.id}/${i}`,{method:"PUT",body:blob,headers:{"ngrok-skip-browser-warning":"1"}}); if(r.ok) break; throw new Error("HTTP "+r.status); }
-          catch(e){ if(a>=6) throw e; await new Promise(r=>setTimeout(r,1000*2**a)); }
-        }
-        sent+=blob.size; showProg();
+// ---------- yükleme ----------
+const upQ = []; let upBusy = false;
+function addFiles(list){ for(const f of list) upQ.push(f); pumpUploads(); }
+async function pumpUploads(){
+  if(upBusy) return; upBusy = true;
+  while(upQ.length){ const f = upQ.shift(); try{ await uploadOne(f); }catch(e){ toast(`${f.name}: ${e.message}`); } }
+  upBusy = false; $("upStat").textContent = "";
+}
+async function uploadOne(file){
+  const init = await post("/api/upload/init", {name:file.name, size:file.size});
+  const CH=init.chunk_size, total=init.chunks; let next=0, sent=0; const t0=performance.now();
+  const show=()=>{ const p=sent/file.size, el=(performance.now()-t0)/1000, sp=sent/Math.max(el,.001);
+    $("upStat").textContent=`⬆️ ${file.name}: %${(p*100).toFixed(0)} · ${fmtBytes(sent)} / ${fmtBytes(file.size)} · ${fmtBytes(sp)}/sn · kalan ${fmtTime((file.size-sent)/Math.max(sp,1))}${upQ.length?` · sırada ${upQ.length} dosya`:""}`; };
+  show();
+  async function worker(){
+    while(true){
+      const i=next++; if(i>=total) return;
+      const blob=file.slice(i*CH, Math.min(file.size,(i+1)*CH));
+      for(let a=0;;a++){
+        try{ const r=await fetch(`/api/upload/${init.id}/${i}`,{method:"PUT",body:blob,headers:{"ngrok-skip-browser-warning":"1"}}); if(r.ok) break; throw new Error("HTTP "+r.status); }
+        catch(e){ if(a>=6) throw e; await new Promise(r=>setTimeout(r,1000*2**a)); }
       }
+      sent+=blob.size; show();
     }
-    await Promise.all([worker(),worker(),worker()]);
-    $("fStat").textContent="Video inceleniyor…";
-    const res=await api(`/api/upload/${init.id}/complete`,{method:"POST"});
-    upload=res; const i=res.info;
-    $("fBar").style.width="100%";
-    $("fStat").textContent=`✅ Yüklendi · ${fmtBytes(file.size)}`;
-    const pills=[["Çözünürlük",`${i.width}×${i.height}`],["FPS",i.fps],["Süre",fmtTime(i.duration)],["Kare",(i.frames||0).toLocaleString("tr-TR")],["Codec",i.codec+(i.bits>8?` ${i.bits}-bit`:"")],["Ses",i.has_audio?(i.acodec||"var"):"yok"]];
-    if(i.hdr) pills.push(["HDR","SDR'ye çevrilecek"]);
-    for(const [k,v] of pills){ const p=document.createElement("span"); p.className="pill"; p.append(k+": "); const b=document.createElement("b"); b.textContent=v; p.appendChild(b); $("fInfo").appendChild(p); }
-  }catch(e){ $("fStat").textContent="❌ "+e.message; toast("Yükleme başarısız: "+e.message); }
-  uploading=false; updateSummary();
-}
-
-async function startJob(){
-  if(!upload) return;
-  const body={upload_id:upload.id,res:val("res"),fps:val("fps"),model:val("model"),codec:val("codec"),quality:val("quality"),scene:$("scene").checked,dedup:$("dedup").checked};
-  $("startBtn").disabled=true;
-  try{ await api("/api/jobs",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}); toast("✅ İş kuyruğa eklendi. Aynı videoyu farklı ayarlarla da başlatabilirsiniz."); refresh(); }
-  catch(e){ toast("Başlatılamadı: "+e.message); }
-  setTimeout(()=>{$("startBtn").disabled=!upload;},800);
-}
-
-function renderJobs(data){
-  if(data && "dl_base" in data) dlBase = data.dl_base;
-  const box=$("jobs"); const jobs=(data&&data.jobs)||[];
-  if(!jobs.length){ box.innerHTML='<div class="jobs-empty">Henüz iş yok.</div>'; return; }
-  box.innerHTML="";
-  for(const j of jobs){
-    const d=document.createElement("div"); d.className="job";
-    const top=document.createElement("div"); top.className="top";
-    const left=document.createElement("div");
-    const tt=document.createElement("div"); tt.className="title"; tt.textContent=j.name;
-    const sub=document.createElement("div"); sub.className="muted"; sub.textContent=`${j.in_desc}  →  ${j.out_desc}`;
-    left.append(tt,sub);
-    const bd=document.createElement("span"); bd.className="badge b-"+j.status;
-    bd.textContent = j.status==="queued" && j.queue_pos ? `Sırada (${j.queue_pos})` : STATUS[j.status]||j.status;
-    top.append(left,bd); d.appendChild(top);
-    if(j.status==="running"||j.status==="queued"){
-      const bar=document.createElement("div"); bar.className="bar"; const i=document.createElement("i"); i.style.width=((j.progress||0)*100).toFixed(1)+"%"; bar.appendChild(i); d.appendChild(bar);
-      const st=document.createElement("div"); st.className="stats";
-      const a=document.createElement("span"); a.textContent=`${j.stage||""}${j.status==="running"?" · %"+((j.progress||0)*100).toFixed(1):""}`;
-      const b=document.createElement("span");
-      if(j.status==="running" && j.done) b.textContent=`${j.done.toLocaleString("tr-TR")} / ${(j.total||0).toLocaleString("tr-TR")} kare · ${j.fps_proc||0} kare/sn · kalan ${fmtTime(j.eta)}`;
-      st.append(a,b); d.appendChild(st);
-    }
-    if(j.engine&&j.engine.length){ const e=document.createElement("div"); e.className="eng"; e.textContent=j.engine.join(" · "); d.appendChild(e); }
-    if(j.status==="done"){ const st=document.createElement("div"); st.className="stats"; const a=document.createElement("span"); a.textContent=`📦 ${fmtBytes(j.out_size)} · ⏱️ ${fmtTime((j.finished||0)-(j.started||0))}${j.drive?" · ☁️ Drive'a kaydedildi":""}`; st.appendChild(a); d.appendChild(st); }
-    if(j.status==="error"){ const e=document.createElement("div"); e.className="errm"; e.textContent=j.error||"Bilinmeyen hata"; d.appendChild(e); }
-    const acts=document.createElement("div"); acts.className="acts";
-    if(j.status==="done"){
-      const path=`/api/download/${j.id}?t=${j.dl_token||""}`;
-      const a=document.createElement("a"); a.className="btn sm"; a.href=(dlBase||"")+path; a.textContent="⬇️ İndir"; a.setAttribute("download", j.out_name||""); acts.appendChild(a);
-      if(dlBase){ const alt=document.createElement("a"); alt.className="alt"; alt.href=path; alt.textContent="alternatif link"; alt.setAttribute("download", j.out_name||""); acts.appendChild(alt); }
-    }
-    const del=document.createElement("button"); del.className="btn sm red";
-    del.textContent = (j.status==="running"||j.status==="queued") ? "✖ İptal et" : "🗑 Sil";
-    del.onclick=async()=>{ if(!confirm(j.status==="running"||j.status==="queued"?"Bu iş iptal edilsin mi?":"Bu iş ve çıktı dosyası silinsin mi?")) return; try{ await api(`/api/jobs/${j.id}`,{method:"DELETE"}); refresh(); }catch(e){ toast(e.message); } };
-    acts.appendChild(del); d.appendChild(acts);
-    box.appendChild(d);
   }
+  await Promise.all([worker(),worker(),worker()]);
+  $("upStat").textContent=`🔎 ${file.name}: inceleniyor…`;
+  await post(`/api/upload/${init.id}/complete`);
+}
+async function addUrl(){
+  const u = $("urlIn").value.trim();
+  if(!/^https?:\/\//i.test(u)) return toast("Geçerli bir link girin (https://… ile başlamalı).");
+  $("urlBtn").disabled = true;
+  try{ await post("/api/sources/url", {url:u}); $("urlIn").value=""; toast("⬇️ İndirme başladı — ilerlemeyi listede görebilirsiniz."); }
+  catch(e){ toast(e.message); }
+  $("urlBtn").disabled = false;
+}
+async function toggleDrive(){
+  const p = $("drivePanel");
+  if(!p.hidden){ p.hidden = true; return; }
+  p.hidden = false; p.innerHTML = '<div class="muted">Drive taranıyor…</div>';
+  try{
+    const d = await api("/api/drive");
+    const head = `<div class="muted" style="margin-bottom:6px">📁 Drive'daki <b>${esc(d.folder)}</b> klasörü ve Drive ana klasörü</div>`;
+    p.innerHTML = head + (d.items.length ? d.items.map(it=>`<div class="drow"><span class="nm" title="${esc(it.path)}">${esc(it.path)}</span><span class="muted">${fmtBytes(it.size)}</span><button class="btn sm ghost" data-act="drive-add" data-path="${esc(it.path)}">Ekle</button></div>`).join("") : `<div class="muted">Video bulunamadı. Videolarınızı Drive'da <b>${esc(d.folder)}</b> klasörüne koyup tekrar açın.</div>`);
+  }catch(e){ p.innerHTML = `<div class="errm">${esc(e.message)}</div>`; }
 }
 
-async function refresh(){ try{ renderJobs(await api("/api/jobs")); }catch(e){} }
+// ---------- ayar özeti ----------
+function updateSummary(){
+  const list = selReady(), box = $("summary");
+  $("startBtn").disabled = !list.length; $("pvBtn").disabled = !list.length;
+  $("startBtn").textContent = list.length > 1 ? `🚀 ${list.length} videoyu başlat` : "🚀 İşlemi Başlat";
+  if(!list.length){ box.textContent = S.sources.some(s=>s.status==="ready") ? "Ayarları uygulamak için listeden video seçin (☑)." : "Önce bir video ekleyin."; return; }
+  const res=val("res"), fps=val("fps"), slow=+val("slow"), enh=$("enhance").checked;
+  let st=null, en=null, bad=false; try{ st=parseTime($("tStart").value); en=parseTime($("tEnd").value); }catch(e){ bad=true; }
+  const rows = list.slice(0,4).map(s => {
+    const i=s.info; let [w,h,ai]=plan(i.width,i.height,res); ai = ai || enh;
+    const ofps = fps==="orig" ? i.fps : +fps, rate = ofps*slow;
+    const seg = Math.max(0, (en!=null ? Math.min(en, i.duration) : i.duration) - (st||0));
+    return `<div><b>${esc(s.name)}</b><span class="muted"> · ${i.width}×${i.height} @ ${i.fps} → <b>${w}×${h} @ ${+ofps.toFixed(2)} FPS</b></span></div>
+      <div class="muted">${ai?"AI büyütme/iyileştirme":"AI yok (yalnızca boyutlandırma)"} · ${rate>i.fps*1.01?`RIFE 4.26 ile ${Math.round(rate/i.fps*10)/10}× ara kare`:"interpolasyon yok"} · ≈ ${Math.round(seg*rate).toLocaleString("tr-TR")} kare · çıktı ${fmtClock(seg*slow)}</div>`;
+  });
+  let notes = list.length>4 ? `<div class="muted">… ve ${list.length-4} video daha</div>` : "";
+  if(bad) notes += `<div class="note">Zaman biçimi hatalı — örnek: 90, 1:30 veya 0:01:30</div>`;
+  if(slow>1) notes += `<div class="note">Ağır çekimde ses kaldırılır.</div>`;
+  if(val("codec")==="h265") notes += `<div class="muted" style="margin-top:6px">ℹ️ H.265 10-bit: telefon, TV, VLC ve modern tarayıcılarda oynar. Eski cihazlar için H.264 seçin.</div>`;
+  box.innerHTML = rows.join("") + notes;
+}
+
+// ---------- işler ----------
+function jobHtml(j){
+  const run = j.status==="running"||j.status==="queued";
+  const badge = j.status==="queued" && j.queue_pos ? `Sırada (${j.queue_pos})` : (STATUS[j.status]||j.status);
+  let h = `<div class="job"><div class="top"><div><div class="title">${esc(j.name)}</div><div class="muted">${esc(j.in_desc)}  →  ${esc(j.out_desc)}</div></div><span class="badge b-${j.status}">${esc(badge)}</span></div>`;
+  if(run){
+    const pct = ((j.progress||0)*100).toFixed(1);
+    h += `<div class="bar"><i style="width:${pct}%"></i></div><div class="stats"><span>${esc(j.stage||"")}${j.status==="running"?" · %"+pct:""}</span><span>${j.status==="running"&&j.done?`${j.done.toLocaleString("tr-TR")} / ${(j.total||0).toLocaleString("tr-TR")} kare · ${j.fps_proc||0} kare/sn · kalan ${fmtTime(j.eta)}`:""}</span></div>`;
+  }
+  if(j.engine&&j.engine.length) h += `<div class="eng">${esc(j.engine.join(" · "))}</div>`;
+  if(j.status==="done") h += `<div class="stats"><span>📦 ${fmtBytes(j.out_size)} · ⏱️ ${fmtTime((j.finished||0)-(j.started||0))}${j.drive?" · ☁️ Drive'a kaydedildi":""}</span></div>`;
+  if(j.status==="error") h += `<div class="errm">${esc(j.error||"Bilinmeyen hata")}</div>`;
+  h += `<div class="acts">`;
+  if(j.status==="done"){
+    const p = `/api/download/${j.id}?t=${j.dl_token||""}`;
+    h += `<a class="btn sm" href="${esc((S.dlBase||"")+p)}" download="${esc(j.out_name||"")}">⬇️ İndir</a>`;
+    if(S.dlBase) h += `<a class="alt" href="${esc(p)}" download="${esc(j.out_name||"")}">alternatif link</a>`;
+  }
+  if((j.status==="error"||j.status==="canceled") && S.sources.some(s=>s.id===j.source_id)) h += `<button class="btn sm ghost" data-act="job-retry" data-id="${j.id}">↻ Tekrar dene</button>`;
+  h += `<button class="btn sm red" data-act="job-del" data-id="${j.id}" data-run="${run?1:0}">${run?"✖ İptal et":"🗑 Sil"}</button></div></div>`;
+  return h;
+}
+function renderJobs(){ renderKeyed($("jobs"), S.jobs, j=>j.id, jobHtml, '<div class="empty">Henüz iş yok.</div>'); }
+async function startJobs(){
+  const list = selReady(); if(!list.length) return;
+  try{ parseTime($("tStart").value); parseTime($("tEnd").value); }catch(e){ return toast("Zaman biçimi hatalı — örnek: 90, 1:30 veya 0:01:30"); }
+  if("Notification" in window && Notification.permission==="default"){ try{ Notification.requestPermission(); }catch(e){} }
+  const body = {source_ids:list.map(s=>s.id), res:val("res"), fps:val("fps"), slow:val("slow"), model:val("model"), codec:val("codec"), quality:val("quality"),
+    scene:$("scene").checked, dedup:$("dedup").checked, enhance:$("enhance").checked, start:$("tStart").value, end:$("tEnd").value};
+  $("startBtn").disabled = true;
+  try{
+    const r = await post("/api/jobs", body);
+    toast(`✅ ${r.jobs.length} iş kuyruğa eklendi${r.errors.length?" · "+r.errors.join(" · "):""}`);
+  }catch(e){ toast("Başlatılamadı: "+e.message); }
+  setTimeout(updateSummary, 800);
+}
+function notifyChanges(jobs){
+  if(lastStatus===null){ lastStatus = Object.fromEntries(jobs.map(j=>[j.id,j.status])); return; }
+  for(const j of jobs){
+    const p = lastStatus[j.id];
+    if(p && p!==j.status && (j.status==="done"||j.status==="error")){
+      const msg = j.status==="done" ? "✅ Video hazır" : "❌ İşlem başarısız";
+      toast(`${msg}: ${j.name}`);
+      if("Notification" in window && Notification.permission==="granted"){ try{ new Notification(msg, {body:j.name}); }catch(e){} }
+    }
+  }
+  lastStatus = Object.fromEntries(jobs.map(j=>[j.id,j.status]));
+}
+
+// ---------- önizleme ----------
+let pv = null, pvMode = "full", pvPos = 0.5;
+async function makePreview(){
+  const s = selReady()[0]; if(!s) return toast("Önce listeden bir video seçin.");
+  $("pvCard").hidden = false; $("cmp").classList.add("busy");
+  $("pvBtn").disabled = true; $("pvBtn").textContent = "⏳ Hazırlanıyor…";
+  try{
+    const r = await post("/api/preview", {source_id:s.id, res:val("res"), model:val("model"), enhance:$("enhance").checked, pos:+$("pvPos").value/100});
+    pv = Object.assign(r, {cx:.5, cy:.5, name:s.name});
+    showPv(); $("pvCard").scrollIntoView({behavior:"smooth", block:"start"});
+  }catch(e){ toast("Önizleme başarısız: "+e.message); $("cmp").classList.remove("busy"); }
+  $("pvBtn").textContent = "👁️ Önizleme"; updateSummary();
+}
+function pvUrl(kind){ let u = `${S.dlBase||""}/api/preview/${pv.id}/${pvMode}_${kind}.jpg?t=${pv.token}`; if(pvMode==="crop") u += `&x=${pv.cx.toFixed(4)}&y=${pv.cy.toFixed(4)}`; return u; }
+function showPv(){
+  if(!pv) return;
+  $("cmp").classList.add("busy");
+  const a = $("cmpA"), b = $("cmpB"); let n = 0; const done = () => { if(++n===2) $("cmp").classList.remove("busy"); };
+  a.onload = b.onload = a.onerror = b.onerror = done;
+  a.src = pvUrl("after"); b.src = pvUrl("before");
+  $("tagL").textContent = "Önce · klasik büyütme"; $("tagR").textContent = pv.ai ? "Sonra · "+pv.model : "Sonra (bu ayarlarla AI yok)";
+  $("pvFull").classList.toggle("on", pvMode==="full"); $("pvCrop").classList.toggle("on", pvMode==="crop");
+  $("pvInfo").textContent = `${pv.name} · ${fmtClock(pv.time)} · çıktı ${pv.w}×${pv.h}${pv.ai?` · AI ${pv.ms} ms`:""}${pvMode==="full"?" · %100 detay için görüntüde bir noktaya çift tıklayın":""}`;
+}
+function setSplit(p){ pvPos = Math.min(1, Math.max(0, p)); $("cmpB").style.clipPath = `inset(0 ${((1-pvPos)*100).toFixed(2)}% 0 0)`; $("cmpH").style.left = (pvPos*100).toFixed(2)+"%"; }
+
+// ---------- canlı durum ----------
+function onSnapshot(d){
+  if("dl_base" in d) S.dlBase = d.dl_base;
+  S.drive = !!d.drive; $("driveBtn").hidden = !S.drive;
+  const ids = new Set(d.sources.map(s=>s.id));
+  if(known===null){ known = new Set(d.sources.filter(s=>s.status==="ready").map(s=>s.id)); }
+  for(const s of d.sources) if(s.status==="ready" && !known.has(s.id)){ known.add(s.id); selected.add(s.id); }
+  for(const id of [...selected]) if(!ids.has(id)) selected.delete(id);
+  save("v3_sel", [...selected]);
+  S.sources = d.sources; S.jobs = d.jobs;
+  renderSources(); renderJobs(); notifyChanges(d.jobs); updateSummary();
+  const r = S.jobs.find(j=>j.status==="running");
+  document.title = r ? `%${((r.progress||0)*100).toFixed(0)} · AI Video Upscaler` : "AI Video Upscaler";
+}
+function onSys(d){
+  const t = $("gpuTxt"); t.innerHTML = "";
+  if(d.gpu){
+    const b = document.createElement("b"); b.textContent = d.gpu; t.appendChild(b);
+    const parts = [];
+    if(d.gpu_util!=null) parts.push(`%${d.gpu_util}`);
+    if(d.mem_used!=null) parts.push(`${d.mem_used}/${d.mem_total} GB`);
+    if(d.temp!=null) parts.push(`${d.temp}°C`);
+    if(parts.length) t.append(" · "+parts.join(" · "));
+    $("gpuDot").classList.remove("warn");
+  } else { const b = document.createElement("b"); b.textContent = "GPU yok"; t.append(b, " · çok yavaş çalışır"); $("gpuDot").classList.add("warn"); }
+  if(d.disk_free_gb!=null){ $("diskChip").hidden = false; $("diskChip").textContent = `💾 ${d.disk_free_gb} GB boş`; }
+}
+async function refresh(){ try{ onSnapshot(await api("/api/state")); }catch(e){} }
 function connectEvents(){
   let errs=0, polling=null;
   const startPoll=()=>{ if(!polling) polling=setInterval(refresh,3000); };
   if(!window.EventSource){ startPoll(); return; }
   const es=new EventSource("/api/events");
-  es.onmessage=e=>{ errs=0; try{ renderJobs(JSON.parse(e.data)); }catch(x){} };
+  es.onmessage=e=>{ errs=0; try{ onSnapshot(JSON.parse(e.data)); }catch(x){ console.error(x); } };
+  es.addEventListener("sys", e=>{ try{ onSys(JSON.parse(e.data)); }catch(x){} });
   es.onerror=()=>{ if(++errs>=4){ es.close(); startPoll(); } };
 }
 async function loadInfo(){
-  try{
-    const i=await api("/api/info");
-    dlBase=i.dl_base||null;
-    $("gpuTxt").innerHTML=""; const b=document.createElement("b");
-    if(i.gpu){ b.textContent=i.gpu; $("gpuTxt").append(b, ` · ${i.vram_gb} GB${i.nvenc?" · NVENC":""}`); }
-    else { $("gpuDot").classList.add("warn"); b.textContent="GPU yok"; $("gpuTxt").append(b," · çok yavaş çalışır"); }
-  }catch(e){ $("gpuDot").classList.add("warn"); $("gpuTxt").textContent=e.message.includes("401")?"Şifre gerekli":"Sunucuya ulaşılamadı"; }
+  try{ const i = await api("/api/info"); S.dlBase = i.dl_base||null; onSys(Object.assign({gpu:i.gpu}, i.sys||{})); }
+  catch(e){ $("gpuDot").classList.add("warn"); $("gpuTxt").textContent = e.message.includes("401") ? "Şifre gerekli" : "Sunucuya ulaşılamadı"; }
 }
 
-buildOpts(); updateSummary(); loadInfo(); refresh(); connectEvents();
+// ---------- olaylar ----------
+buildOpts(); updateSummary(); loadInfo(); refresh(); connectEvents(); setSplit(.5);
 const drop=$("drop"), fin=$("fileIn");
 drop.onclick=()=>fin.click();
 drop.onkeydown=e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); fin.click(); } };
-fin.onchange=()=>{ if(fin.files[0]) uploadFile(fin.files[0]); fin.value=""; };
+fin.onchange=()=>{ if(fin.files.length) addFiles([...fin.files]); fin.value=""; };
 ["dragenter","dragover"].forEach(n=>drop.addEventListener(n,e=>{e.preventDefault();drop.classList.add("over");}));
 ["dragleave","drop"].forEach(n=>drop.addEventListener(n,e=>{e.preventDefault();drop.classList.remove("over");}));
-drop.addEventListener("drop",e=>{ const f=e.dataTransfer.files[0]; if(f) uploadFile(f); });
-$("startBtn").onclick=startJob;
+drop.addEventListener("drop",e=>{ if(e.dataTransfer.files.length) addFiles([...e.dataTransfer.files]); });
+$("urlBtn").onclick=addUrl;
+$("selAll").onclick=()=>selectAll(true);
+$("selNone").onclick=()=>selectAll(false);
+$("urlIn").onkeydown=e=>{ if(e.key==="Enter") addUrl(); };
+$("driveBtn").onclick=toggleDrive;
+$("drivePanel").addEventListener("click", async e=>{
+  const b = e.target.closest("[data-act=drive-add]"); if(!b) return;
+  b.disabled = true;
+  try{ await post("/api/sources/drive", {path:b.dataset.path}); b.textContent = "✓ Eklendi"; }catch(x){ toast(x.message); b.disabled = false; }
+});
+$("srcList").addEventListener("change", e=>{
+  const c = e.target.closest("[data-act=sel]"); if(!c) return;
+  if(c.checked) selected.add(c.dataset.id); else selected.delete(c.dataset.id);
+  save("v3_sel", [...selected]); renderSources(); updateSummary();
+});
+$("srcList").addEventListener("click", async e=>{
+  const b = e.target.closest("[data-act=src-del]"); if(!b) return;
+  if(!confirm("Bu video listeden kaldırılıp Colab diskinden silinsin mi?")) return;
+  try{ await api(`/api/sources/${b.dataset.id}`, {method:"DELETE"}); refresh(); }catch(x){ toast(x.message); }
+});
+$("jobs").addEventListener("click", async e=>{
+  const b = e.target.closest("[data-act]"); if(!b) return;
+  if(b.dataset.act==="job-retry"){ try{ await post(`/api/jobs/${b.dataset.id}/retry`); toast("↻ Yeniden kuyruğa eklendi"); }catch(x){ toast(x.message); } }
+  if(b.dataset.act==="job-del"){
+    if(!confirm(b.dataset.run==="1" ? "Bu iş iptal edilsin mi?" : "Bu iş ve çıktı dosyası silinsin mi?")) return;
+    try{ await api(`/api/jobs/${b.dataset.id}`, {method:"DELETE"}); refresh(); }catch(x){ toast(x.message); }
+  }
+});
+$("startBtn").onclick=startJobs;
+$("pvBtn").onclick=makePreview;
+$("pvRefresh").onclick=makePreview;
+$("pvPos").onchange=()=>{ if(pv) makePreview(); };
+$("pvFull").onclick=()=>{ pvMode="full"; showPv(); };
+$("pvCrop").onclick=()=>{ pvMode="crop"; showPv(); };
+const cmp=$("cmp"); let drag=false;
+const posOf = e => { const r=cmp.getBoundingClientRect(); return [(e.clientX-r.left)/r.width, (e.clientY-r.top)/r.height]; };
+cmp.addEventListener("pointerdown", e=>{ drag=true; try{ cmp.setPointerCapture(e.pointerId); }catch(x){} setSplit(posOf(e)[0]); });
+cmp.addEventListener("pointermove", e=>{ if(drag) setSplit(posOf(e)[0]); });
+cmp.addEventListener("pointerup", ()=>{ drag=false; });
+cmp.addEventListener("dblclick", e=>{ if(!pv || pvMode!=="full") return; const [x,y]=posOf(e); pv.cx=Math.min(1,Math.max(0,x)); pv.cy=Math.min(1,Math.max(0,y)); pvMode="crop"; showPv(); });
 </script>
 </body>
 </html>
@@ -1398,20 +2047,20 @@ $("startBtn").onclick=startJob;
 
 
 class BasicAuth:
-    """Saf ASGI şifre katmanı (SSE/indirme dahil her isteği korur; imzalı indirme linkleri hariç)."""
+    """Saf ASGI şifre katmanı (SSE/indirme dahil her isteği korur; imzalı indirme/önizleme linkleri hariç)."""
 
     def __init__(self, app, password):
         self.app, self.password = app, password
 
-    def _signed_download(self, scope):
-        m = re.fullmatch(r"/api/download/([0-9a-f]+)", scope.get("path", ""))
+    def _signed(self, scope):
+        m = re.match(r"/api/(?:download|preview)/([0-9a-f]+)", scope.get("path", ""))
         if not m:
             return False
         t = urllib.parse.parse_qs(scope.get("query_string", b"").decode("latin-1")).get("t", [""])[0]
         return hmac.compare_digest(t, dl_token(m.group(1)))
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or self._signed_download(scope):
+        if scope["type"] != "http" or self._signed(scope):
             return await self.app(scope, receive, send)
         header = dict(scope.get("headers") or []).get(b"authorization", b"")
         ok = False
@@ -1433,17 +2082,41 @@ class BasicAuth:
         await send({"type": "http.response.body", "body": "Şifre gerekli".encode()})
 
 
+def _parse_opts(d):
+    try:
+        opts = {"res": str(d.get("res")), "fps": str(d.get("fps")), "slow": str(d.get("slow", "1")),
+                "model": str(d.get("model")), "codec": str(d.get("codec")), "quality": str(d.get("quality")),
+                "scene": bool(d.get("scene", True)), "dedup": bool(d.get("dedup", True)),
+                "enhance": bool(d.get("enhance", False)), "start": parse_time(d.get("start")),
+                "end": parse_time(d.get("end"))}
+    except ValueError:
+        return None
+    if (opts["res"] not in RES_TARGETS or opts["fps"] not in FPS_CHOICES or opts["slow"] not in SLOW_CHOICES
+            or opts["model"] not in MODEL_CHOICES or opts["codec"] not in CODEC_CHOICES
+            or opts["quality"] not in QUALITY_CHOICES):
+        return None
+    return opts
+
+
 def create_app(stop_event):
     import asyncio
 
     from fastapi import FastAPI, HTTPException, Request
-    from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+    from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
     from starlette.concurrency import run_in_threadpool
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     if SIFRE:
         app.add_middleware(BasicAuth, password=SIFRE)
     page = PAGE_HTML.replace("__VERSION__", VERSION)
+
+    def get_source(sid, ready=True):
+        src = SOURCES.get(sid)
+        if not src:
+            raise HTTPException(404, "Video bulunamadı.")
+        if ready and src["status"] != "ready":
+            raise HTTPException(409, "Video henüz hazır değil.")
+        return src
 
     @app.get("/", response_class=HTMLResponse)
     async def index():
@@ -1452,8 +2125,14 @@ def create_app(stop_event):
     @app.get("/api/info")
     async def info():
         return {"gpu": GPU_NAME, "vram_gb": VRAM_GB, "nvenc": NVENC["h264"] or NVENC["hevc"], "version": VERSION,
-                "drive": bool(DRIVE_DIR), "dl_base": DL_STATE["base"]}
+                "drive": bool(DRIVE_DIR), "dl_base": DL_STATE["base"], "sys": dict(SYS)}
 
+    @app.get("/api/state")
+    @app.get("/api/jobs")
+    async def state():
+        return snapshot()
+
+    # --- yükleme ---
     @app.post("/api/upload/init")
     async def upload_init(req: Request):
         d = await req.json()
@@ -1463,14 +2142,12 @@ def create_app(stop_event):
             raise HTTPException(400, "Dosya boş.")
         if size > shutil.disk_usage(BASE).free - 3 * 1024 ** 3:
             raise HTTPException(507, "Colab diskinde yeterli yer yok.")
-        uid = uuid.uuid4().hex[:12]
-        ext = re.sub(r"[^\w.]", "", Path(name).suffix)[:10] or ".mp4"
-        path = UP_DIR / f"{uid}{ext}"
-        with open(path, "wb") as f:
+        ext = re.sub(r"[^\w.]", "", Path(name).suffix)[:10].lower() or ".mp4"
+        src = new_source(name, "upload", size, "uploading", ext)
+        with open(src["path"], "wb") as f:
             f.truncate(size)
-        UPLOADS[uid] = {"id": uid, "name": name, "size": size, "path": str(path),
-                        "chunks": max(1, math.ceil(size / CHUNK)), "received": set(), "info": None}
-        return {"id": uid, "chunk_size": CHUNK, "chunks": UPLOADS[uid]["chunks"]}
+        src.update(chunks=max(1, math.ceil(size / CHUNK)), received=set())
+        return {"id": src["id"], "chunk_size": CHUNK, "chunks": src["chunks"]}
 
     def _pwrite(path, offset, data):
         fd = os.open(path, os.O_WRONLY)
@@ -1482,14 +2159,14 @@ def create_app(stop_event):
         finally:
             os.close(fd)
 
-    @app.put("/api/upload/{uid}/{idx}")
-    async def upload_chunk(uid: str, idx: int, req: Request):
-        up = UPLOADS.get(uid)
-        if not up:
+    @app.put("/api/upload/{sid}/{idx}")
+    async def upload_chunk(sid: str, idx: int, req: Request):
+        src = SOURCES.get(sid)
+        if not src or src["status"] != "uploading":
             raise HTTPException(404, "Yükleme bulunamadı.")
-        if not 0 <= idx < up["chunks"]:
+        if not 0 <= idx < src["chunks"]:
             raise HTTPException(400, "Geçersiz parça.")
-        expected = min(CHUNK, up["size"] - idx * CHUNK)
+        expected = min(CHUNK, src["size"] - idx * CHUNK)
         body = bytearray()
         async for part in req.stream():
             body += part
@@ -1497,56 +2174,134 @@ def create_app(stop_event):
                 raise HTTPException(413, "Parça çok büyük.")
         if len(body) != expected:
             raise HTTPException(400, "Parça eksik geldi.")
-        await run_in_threadpool(_pwrite, up["path"], idx * CHUNK, body)
-        up["received"].add(idx)
+        await run_in_threadpool(_pwrite, src["path"], idx * CHUNK, body)
+        src["received"].add(idx)
+        src_set(src, progress=len(src["received"]) / src["chunks"],
+                stage=f"{min(len(src['received']) * CHUNK, src['size']) / 1024 ** 2:.0f} / "
+                      f"{src['size'] / 1024 ** 2:.0f} MB")
         return {"ok": True}
 
-    @app.post("/api/upload/{uid}/complete")
-    async def upload_complete(uid: str):
-        up = UPLOADS.get(uid)
-        if not up:
-            raise HTTPException(404, "Yükleme bulunamadı.")
-        missing = up["chunks"] - len(up["received"])
+    @app.post("/api/upload/{sid}/complete")
+    async def upload_complete(sid: str):
+        src = get_source(sid, ready=False)
+        if src["status"] != "uploading":
+            raise HTTPException(409, "Bu yükleme zaten tamamlandı.")
+        missing = src["chunks"] - len(src["received"])
         if missing:
             raise HTTPException(400, f"{missing} parça eksik.")
-        try:
-            up["info"] = await run_in_threadpool(probe_video, up["path"])
-        except Exception as e:  # noqa: BLE001
-            raise HTTPException(400, f"Video okunamadı: {e}") from e
-        log(f"Yüklendi: {up['name']} ({up['size'] / 1024 ** 2:.1f} MB, {up['info']['width']}x{up['info']['height']}"
-            f" @ {up['info']['fps']} fps)")
-        return {"id": uid, "name": up["name"], "info": up["info"]}
+        if not await run_in_threadpool(finalize_source, src):
+            raise HTTPException(400, src["error"] or "Video okunamadı.")
+        return {k: src.get(k) for k in SRC_KEYS}
 
-    @app.post("/api/jobs")
-    async def create_job(req: Request):
+    # --- link ve Drive ---
+    @app.post("/api/sources/url")
+    async def add_url(req: Request):
+        url = str((await req.json()).get("url") or "").strip()
+        if not re.match(r"^https?://\S+$", url):
+            raise HTTPException(400, "Geçerli bir http(s) linki girin.")
+        name = urllib.parse.urlparse(url).netloc + "…"
+        src = new_source(name, "url", 0, "downloading", "")
+        src_set(src, stage="Bağlanılıyor")
+        threading.Thread(target=import_url, args=(src, url), daemon=True).start()
+        return {k: src.get(k) for k in SRC_KEYS}
+
+    @app.get("/api/drive")
+    async def drive_list():
+        if not DRIVE_DIR:
+            raise HTTPException(404, "Google Drive bağlı değil (Colab formunda DRIVE_KAYDET'i açın).")
+        items = await run_in_threadpool(list_drive)
+        return {"folder": str((DRIVE_DIR / "girdi").relative_to(DRIVE_ROOT)), "items": items}
+
+    @app.post("/api/sources/drive")
+    async def add_drive(req: Request):
+        if not DRIVE_DIR:
+            raise HTTPException(404, "Google Drive bağlı değil.")
+        rel = str((await req.json()).get("path") or "")
+        path = (DRIVE_ROOT / rel).resolve()
+        if DRIVE_ROOT.resolve() not in path.parents or not path.is_file() or path.suffix.lower() not in VIDEO_EXTS:
+            raise HTTPException(400, "Geçersiz dosya.")
+        src = new_source(path.name, "drive", path.stat().st_size, "downloading", path.suffix.lower())
+        threading.Thread(target=import_drive, args=(src, path), daemon=True).start()
+        return {k: src.get(k) for k in SRC_KEYS}
+
+    @app.get("/api/sources/{sid}/thumb")
+    async def thumb(sid: str):
+        p = UP_DIR / f"{sid}_thumb.jpg"
+        if not re.fullmatch(r"[0-9a-f]+", sid) or not p.exists():
+            raise HTTPException(404, "Yok.")
+        return FileResponse(p, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
+
+    @app.delete("/api/sources/{sid}")
+    async def delete_source(sid: str):
+        src = get_source(sid, ready=False)
+        if src["status"] in ("downloading", "processing"):
+            raise HTTPException(409, "Video hazırlanırken silinemez; bitmesini bekleyin.")
+        if any(j.get("source_id") == sid and j["status"] in ("queued", "running") for j in JOBS.values()):
+            raise HTTPException(409, "Bu video için bekleyen/çalışan iş var; önce işi iptal edin.")
+        registry_put(SOURCES, sid, None)
+        for p in (Path(src["path"]), UP_DIR / f"{sid}_thumb.jpg", UP_DIR / f"{sid}.json"):
+            p.unlink(missing_ok=True)
+        return {"ok": True}
+
+    # --- önizleme ---
+    @app.post("/api/preview")
+    async def preview(req: Request):
         d = await req.json()
-        up = UPLOADS.get(str(d.get("upload_id")))
-        if not up or not up["info"]:
-            raise HTTPException(404, "Önce videoyu yükleyin.")
-        opts = {"res": str(d.get("res")), "fps": str(d.get("fps")), "model": str(d.get("model")),
-                "codec": str(d.get("codec")), "quality": str(d.get("quality")),
-                "scene": bool(d.get("scene", True)), "dedup": bool(d.get("dedup", True))}
-        if (opts["res"] not in RES_TARGETS or opts["fps"] not in FPS_CHOICES or opts["model"] not in MODEL_CHOICES
-                or opts["codec"] not in CODEC_CHOICES or opts["quality"] not in QUALITY_CHOICES):
+        src = get_source(str(d.get("source_id")))
+        opts = _parse_opts({**d, "fps": "orig", "codec": "h265", "quality": "maksimum"})
+        if not opts:
             raise HTTPException(400, "Geçersiz ayar.")
-        i = up["info"]
-        w, h, _ = plan_size(i["width"], i["height"], opts["res"])
-        ofps = i["fps"] if opts["fps"] == "orig" else int(opts["fps"])
-        jid = uuid.uuid4().hex[:10]
-        job = {"id": jid, "name": up["name"], "path": up["path"], "info": dict(i), "opts": opts, "status": "queued",
-               "stage": "Sırada bekliyor", "progress": 0.0, "created": time.time(), "engine": [],
-               "in_desc": f"{i['width']}×{i['height']} @ {i['fps']:g} FPS",
-               "out_desc": f"{w}×{h} @ {ofps:g} FPS · {'H.265 10-bit' if opts['codec'] == 'h265' else 'H.264'}"}
-        with JLOCK:
-            JOBS[jid] = job
-            STATE["version"] += 1
-        JOBQ.put(jid)
-        log(f"[{jid}] Kuyruğa eklendi: {up['name']} → {job['out_desc']}")
-        return job_public(job)
+        try:
+            pos = min(max(float(d.get("pos", 0.35)), 0.0), 1.0)
+            return await run_in_threadpool(make_preview, src, opts, pos)
+        except HTTPException:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log(f"Önizleme hatası: {e}")
+            raise HTTPException(500, "GPU belleği yetmedi." if _is_oom(e) else str(e)[-300:]) from e
 
-    @app.get("/api/jobs")
-    async def list_jobs():
-        return snapshot()
+    @app.get("/api/preview/{pid}/{kind}.jpg")
+    async def preview_img(pid: str, kind: str, x: float = 0.5, y: float = 0.5):
+        if kind not in ("full_before", "full_after", "crop_before", "crop_after"):
+            raise HTTPException(404, "Yok.")
+        data = await run_in_threadpool(preview_image, pid, kind, min(max(x, 0.0), 1.0), min(max(y, 0.0), 1.0))
+        if data is None:
+            raise HTTPException(404, "Önizleme süresi doldu; yeniden oluşturun.")
+        return Response(data, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=600"})
+
+    # --- işler ---
+    @app.post("/api/jobs")
+    async def create_jobs(req: Request):
+        d = await req.json()
+        ids = d.get("source_ids") or ([d["upload_id"]] if d.get("upload_id") else [])
+        opts = _parse_opts(d)
+        if not opts:
+            raise HTTPException(400, "Geçersiz ayar veya zaman biçimi (ör. 90, 1:30).")
+        jobs, errors = [], []
+        for sid in ids:
+            src = SOURCES.get(str(sid))
+            if not src or src["status"] != "ready":
+                errors.append("Hazır olmayan video atlandı")
+                continue
+            try:
+                start, end = job_window(src["info"], opts["start"], opts["end"])
+            except ValueError as e:
+                errors.append(f"{src['name']}: {e}")
+                continue
+            jobs.append(job_public(new_job(src, {**opts, "start": start, "end": end})))
+        if not jobs:
+            raise HTTPException(400, " · ".join(errors) or "Önce video seçin.")
+        return {"jobs": jobs, "errors": errors}
+
+    @app.post("/api/jobs/{jid}/retry")
+    async def retry_job(jid: str):
+        job = JOBS.get(jid)
+        if not job:
+            raise HTTPException(404, "İş bulunamadı.")
+        src = SOURCES.get(job.get("source_id") or "")
+        if not src or src["status"] != "ready":
+            raise HTTPException(409, "Bu işin videosu artık listede yok.")
+        return job_public(new_job(src, job["opts"]))
 
     @app.delete("/api/jobs/{jid}")
     async def delete_job(jid: str):
@@ -1560,9 +2315,8 @@ def create_app(stop_event):
             return {"ok": True}
         if job.get("out_path"):
             Path(job["out_path"]).unlink(missing_ok=True)
-        with JLOCK:
-            JOBS.pop(jid, None)
-            STATE["version"] += 1
+            Path(job["out_path"] + ".json").unlink(missing_ok=True)
+        registry_put(JOBS, jid, None)
         return {"ok": True}
 
     @app.get("/api/download/{jid}")
@@ -1575,7 +2329,7 @@ def create_app(stop_event):
     @app.get("/api/events")
     async def events(req: Request):
         async def gen():
-            last, last_sent = -1, 0.0
+            last, last_sent, last_sys = -1, 0.0, 0.0
             yield "retry: 3000\n\n"
             while not stop_event.is_set():  # kapanışta açık akışlar sunucuyu bekletmesin
                 if await req.is_disconnected():
@@ -1585,6 +2339,9 @@ def create_app(stop_event):
                     data = snapshot()
                     last, last_sent = data["version"], now
                     yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+                if now - last_sys >= 4 and SYS:
+                    last_sys = last_sent = now
+                    yield f"event: sys\ndata: {json.dumps(SYS, ensure_ascii=False)}\n\n"
                 elif now - last_sent > 15:
                     last_sent = now
                     yield ": ping\n\n"
@@ -1655,7 +2412,7 @@ def start_download_tunnel(rt):
     """ngrok ücretsiz planda aylık ~1 GB indirme sınırı var; büyük videolar ayrı bir Cloudflare tünelinden iner."""
     try:
         DL_STATE["base"] = start_cloudflare(PORT, rt)
-        STATE["version"] += 1
+        bump()
         log(f"⚡ Sınırsız indirme tüneli hazır: {DL_STATE['base']} (İndir butonu bunu otomatik kullanır)")
     except Exception as e:  # noqa: BLE001
         log(f"Ek indirme tüneli açılamadı ({e}); indirmeler ana link üzerinden yapılacak.")
@@ -1701,8 +2458,24 @@ def detect_tools():
                                       Fraction(30))
 
 
-def main():
+def setup_drive():
     global DRIVE_DIR
+    if DRIVE_KAYDET and IN_COLAB:
+        try:
+            from google.colab import drive
+            drive.mount("/content/drive")
+        except Exception as e:  # noqa: BLE001
+            log(f"Drive bağlanamadı ({e}); yalnızca Colab diskine kaydedilecek.")
+            return
+    elif not os.environ.get("UPSCALER_DRIVE_ROOT"):
+        return
+    if DRIVE_ROOT.is_dir():
+        DRIVE_DIR = DRIVE_ROOT / "AI_Upscaler"
+        (DRIVE_DIR / "girdi").mkdir(parents=True, exist_ok=True)
+        log(f"Drive bağlı: çıktılar → {DRIVE_DIR} · Drive'dan seçmek için videoları {DRIVE_DIR / 'girdi'} klasörüne koyun")
+
+
+def main():
     old = getattr(builtins, "_AI_UPSCALER_RT", None)
     if old:
         log("Önceki oturum kapatılıyor…")
@@ -1727,16 +2500,10 @@ def main():
     detect_tools()
     log(f"ffmpeg hazır · NVENC H.264: {'✓' if NVENC['h264'] else '✗'} · NVENC H.265 10-bit: "
         f"{'✓' if NVENC['hevc'] else '✗'} · HDR ton eşleme: {'✓' if HAS_ZSCALE else '✗'}")
-
-    if DRIVE_KAYDET and IN_COLAB:
-        try:
-            from google.colab import drive
-            drive.mount("/content/drive")
-            DRIVE_DIR = Path("/content/drive/MyDrive/AI_Upscaler")
-            DRIVE_DIR.mkdir(parents=True, exist_ok=True)
-            log(f"Çıktılar Drive'a da kaydedilecek: {DRIVE_DIR}")
-        except Exception as e:  # noqa: BLE001
-            log(f"Drive bağlanamadı ({e}); yalnızca Colab diskine kaydedilecek.")
+    setup_drive()
+    n_src, n_job = restore_state()
+    if n_src or n_job:
+        log(f"Önceki oturumdan geri yüklendi: {n_src} video, {n_job} biten iş")
 
     # Varsayılan (maksimum kalite) modelleri önceden indirip yükle; diğerleri ilk kullanımda iner.
     MODELS.rife()
@@ -1762,6 +2529,7 @@ def main():
         time.sleep(0.1)
     rt.worker = threading.Thread(target=worker_loop, args=(rt.stop_event,), daemon=True)
     rt.worker.start()
+    threading.Thread(target=sys_monitor, args=(rt.stop_event,), daemon=True).start()
     log(f"Web sunucusu çalışıyor (port {PORT})")
 
     tunnel = TUNEL.strip().lower()

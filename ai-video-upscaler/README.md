@@ -8,8 +8,12 @@ yapay zekâ ile **1080p / 2K / 4K**'ya büyüten ve **60 / 90 / 120 FPS**'e ara 
 | **Büyütme (upscale)** | Real-ESRGAN — `RealESRGAN_x4plus` / `x2plus` (maks. kalite), `x4plus_anime_6B` (anime), `realesr-general-x4v3` (hızlı) |
 | **Ara kare (interpolasyon)** | RIFE **4.26** (Practical-RIFE'ın en yeni modeli) + kopya kare ayıklama + sahne geçişi koruması |
 | **Kodlama** | GPU'da NVENC **H.265 10-bit** (p7 + multipass + uzamsal/zamansal AQ) veya H.264 · NVENC yoksa otomatik CPU yedeği |
-| **Ses** | Orijinal ses kayıpsız kopyalanır (gerekirse AAC 320k) |
-| **Arayüz** | Sürükle-bırak yükleme (büyük dosyalar parça parça), canlı ilerleme/kalan süre, iş kuyruğu, indirme |
+| **Ses** | Orijinal ses kayıpsız kopyalanır (gerekirse AAC 320k); çekim tarihi gibi meta veriler korunur |
+| **Video ekleme** | Çoklu sürükle-bırak yükleme (büyük dosyalar parça parça) · **link ile ekleme** (YouTube, Google Drive paylaşım linki, doğrudan video linki) · **Drive'dan seçme** |
+| **Önizleme** | İşlemeden önce **önce/sonra sürgülü karşılaştırma**, %100 detay görünümü, kare konumu seçimi |
+| **Ekstralar** | Kırpma (başlangıç/bitiş) · **ağır çekim 2×/4×/8×** · aynı çözünürlükte AI iyileştirme · toplu işlem · tekrar dene |
+| **Arayüz** | Canlı ilerleme/kalan süre, canlı GPU kullanımı/VRAM/sıcaklık ve boş disk, tarayıcı bildirimi, iş kuyruğu |
+| **Kalıcılık** | Hücre yeniden çalıştırılsa da (aynı Colab oturumunda) yüklenen videolar ve biten işler listede kalır |
 | **Link** | ngrok ücretsiz sabit adres → **her çalıştırmada aynı link** |
 
 Hepsi ücretsiz araçlardır; ek bir ücretli hizmet gerekmez.
@@ -28,7 +32,7 @@ Hepsi ücretsiz araçlardır; ek bir ücretli hizmet gerekmez.
 1. https://colab.research.google.com → **Yeni not defteri**.
 2. Menü: **Çalışma zamanı → Çalışma zamanı türünü değiştir → L4 GPU** (T4 de çalışır, daha yavaştır).
 3. [`colab_baslat.py`](colab_baslat.py) içeriğini (20 satır) tek bir hücreye yapıştırın. Bu hücre asıl kodu
-   GitHub'dan indirip çalıştırır; 1800 satırı elle kopyalamanız gerekmez.
+   GitHub'dan indirip çalıştırır; uzun kodu elle kopyalamanız gerekmez.
 4. Formda `NGROK_TOKEN` (ve isterseniz `NGROK_DOMAIN`) alanlarını doldurun, ▶ ile çalıştırın.
 5. İlk saniyede `⏳ … yükleniyor` yazısı çıkar; modeller indikten sonra `🌐 WEB ARAYÜZÜ: https://…` linki görünür.
    İlk girişte ngrok uyarı sayfasında **Visit Site**'a basın.
@@ -48,12 +52,25 @@ kısmını `master` yapın.)
 
 ---
 
+## 🎬 Kullanım akışı
+
+1. **Videoları ekleyin:** sürükleyip bırakın (birden fazla olabilir), bir link yapıştırın ya da
+   **📁 Drive'dan seç** ile Drive'daki `AI_Upscaler/girdi` klasöründeki videoları seçin (`DRIVE_KAYDET` açıksa).
+   Eklenen her video küçük resmiyle listelenir ve otomatik seçilir (☑).
+2. **Ayarları seçin** ve **👁️ Önizleme** ile bir karenin önce/sonra halini sürgüyle karşılaştırın. Görüntüye çift
+   tıklarsanız o bölgenin %100 detayını gösterir; "Kare konumu" sürgüsüyle videonun başka bir anını seçebilirsiniz.
+3. Uzun bir videoda önce kısa bir parçayı denemek için **Başlangıç/Bitiş** girin (ör. `1:30` – `1:40`).
+4. **🚀 Başlat** — seçili her video için ayrı bir iş kuyruğa eklenir. Bitince tarayıcı bildirimi gelir; **⬇️ İndir**.
+
 ## 🎛️ Arayüzdeki seçenekler
 
 | Seçenek | Değerler | Açıklama |
 |---|---|---|
 | Çözünürlük | Orijinal · 1080p · 2K · 4K | Kısa kenar 1080/1440/2160 olacak şekilde, en-boy oranı korunur (dikey videolar da desteklenir). Kaynak hedeften büyükse AI atlanır, yalnızca boyutlandırılır. |
 | Kare hızı | Orijinal · 60 · 90 · 120 | RIFE 4.26 ile ara kare. 24→60 gibi tam bölünmeyen oranlar da doğru zamanlamayla üretilir; süre ve ses senkronu korunur. |
+| Ağır çekim | Kapalı · 2× · 4× · 8× | Ara karelerle gerçek ağır çekim (ör. 30 FPS videodan 4× → 120 kare/sn üretilip seçilen FPS'te oynatılır). Ses kaldırılır. |
+| Başlangıç / Bitiş | `90`, `1:30`, `0:01:30.5` | Yalnızca bu aralık işlenir; ses aynı aralıktan alınır. |
+| AI iyileştirme | açık/kapalı | Kaynak zaten hedef boyuttaysa da AI uygular (netleştirme/gürültü temizleme), sonra hedef boyuta indirir. |
 | AI modeli | 💎 Maks. kalite · ⚡ Hızlı · 🎨 Anime | Maks. kalite: ≤2× büyütmede `x2plus`, daha fazlasında `x4plus`. |
 | Video formatı | H.265 10-bit · H.264 | 10-bit, büyütülmüş gökyüzü/gradyanlarda bantlanmayı önler. Eski cihazlar için H.264. |
 | Dosya kalitesi | Maksimum · Yüksek · Dengeli | Maksimum = görsel olarak kayıpsız (büyük dosya). |
@@ -88,8 +105,11 @@ uzun videolarda **⚡ Hızlı** model birkaç kat daha hızlıdır. Gerçek hız
   Cloudflare tüneli** üzerinden indirtir (İndir butonu bunu otomatik kullanır, sınırsızdır). Yüklemeler
   ngrok'un sınırına dahil değildir.
 - `DRIVE_KAYDET` açılırsa biten videolar Google Drive'da `AI_Upscaler` klasörüne de kopyalanır
-  (Colab kapansa da kaybolmaz).
-- `SIFRE` doldurulursa site şifre ister (kullanıcı adı önemsiz). İndirme linkleri imzalıdır.
+  (Colab kapansa da kaybolmaz) ve `AI_Upscaler/girdi` klasörüne koyduğunuz videolar arayüzden seçilebilir.
+  Büyük videoları kendi internetinizden yüklemek yerine Drive'a koyup buradan seçmek çok daha hızlıdır.
+- **Link ile ekleme** yt-dlp kullanır (ilk kullanımda otomatik kurulur). YouTube zaman zaman Colab sunucularını
+  engelleyebilir; o durumda videoyu indirip yükleyin. Yalnızca kullanma hakkınız olan videoları işleyin.
+- `SIFRE` doldurulursa site şifre ister (kullanıcı adı önemsiz). İndirme ve önizleme linkleri imzalıdır.
 
 ## 🛠️ Sorun giderme
 
@@ -100,7 +120,9 @@ uzun videolarda **⚡ Hızlı** model birkaç kat daha hızlıdır. Gerçek hız
 | `ERR_NGROK_4018` | Token hatalı; yeniden kopyalayın. |
 | "GPU bulunamadı" | Çalışma zamanı türünü **L4 GPU** yapın ve hücreyi yeniden çalıştırın. |
 | Video oynamıyor | H.265 desteklemeyen eski bir cihazdır; **H.264** seçin. |
-| Çok yavaş | **⚡ Hızlı** modeli seçin veya hedef çözünürlüğü düşürün. |
+| Çok yavaş | **⚡ Hızlı** modeli seçin veya hedef çözünürlüğü düşürün; önce **Başlangıç/Bitiş** ile kısa bir parça deneyin. |
+| Link indirilemedi | Site Colab'ı engellemiş olabilir (özellikle YouTube). Videoyu indirip yükleyin veya Drive'a koyun. |
+| "Drive'dan seç" butonu yok | Colab formunda `DRIVE_KAYDET`'i açıp hücreyi yeniden çalıştırın. |
 
 ## Lisanslar
 Real-ESRGAN (BSD-3-Clause, xinntao), Practical-RIFE / RIFE (MIT, hzwer). Model ağırlıkları ilk çalıştırmada
