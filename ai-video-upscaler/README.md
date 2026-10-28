@@ -107,8 +107,18 @@ uzun videolarda **⚡ Hızlı** model birkaç kat daha hızlıdır. Gerçek hız
 - `DRIVE_KAYDET` açılırsa biten videolar Google Drive'da `AI_Upscaler` klasörüne de kopyalanır
   (Colab kapansa da kaybolmaz) ve `AI_Upscaler/girdi` klasörüne koyduğunuz videolar arayüzden seçilebilir.
   Büyük videoları kendi internetinizden yüklemek yerine Drive'a koyup buradan seçmek çok daha hızlıdır.
-- **Link ile ekleme** yt-dlp kullanır (ilk kullanımda otomatik kurulur). YouTube zaman zaman Colab sunucularını
-  engelleyebilir; o durumda videoyu indirip yükleyin. Yalnızca kullanma hakkınız olan videoları işleyin.
+- **Link ile ekleme** yt-dlp kullanır (ilk kullanımda otomatik kurulur/güncellenir). Yalnızca kullanma hakkınız
+  olan videoları işleyin.
+- **YouTube "Sign in to confirm you're not a bot" hatası:** Colab sunucuları veri merkezinde olduğu için YouTube
+  giriş doğrulaması isteyebilir. Arayüzdeki **🍪 YouTube çerezi** butonuna basın ve adımları izleyin:
+  1. Tarayıcınıza **Get cookies.txt LOCALLY** (Chrome/Edge) veya **cookies.txt** (Firefox) eklentisini kurun ve
+     gizli pencerede çalışmasına izin verin. ("LOCALLY" olmayan eski Chrome eklentisini kullanmayın.)
+  2. Gizli/özel pencerede YouTube'a — mümkünse **yedek bir Google hesabıyla** — giriş yapın.
+  3. Aynı sekmede `https://www.youtube.com/robots.txt` adresini açıp çerezleri **Export** edin, gizli pencereyi kapatın.
+  4. Dosyayı arayüzden yükleyin, başarısız linkte **↻ Tekrar dene**'ye basın.
+
+  yt-dlp ile kullanılan hesapların YouTube tarafından kısıtlanma riski vardır (yt-dlp de yedek hesap önerir).
+  Çerez dosyası yalnızca o Colab oturumunda saklanır; çerez yüklediyseniz `SIFRE` kullanmanız önerilir.
 - `SIFRE` doldurulursa site şifre ister (kullanıcı adı önemsiz). İndirme ve önizleme linkleri imzalıdır.
 
 ## 🛠️ Sorun giderme
@@ -121,7 +131,8 @@ uzun videolarda **⚡ Hızlı** model birkaç kat daha hızlıdır. Gerçek hız
 | "GPU bulunamadı" | Çalışma zamanı türünü **L4 GPU** yapın ve hücreyi yeniden çalıştırın. |
 | Video oynamıyor | H.265 desteklemeyen eski bir cihazdır; **H.264** seçin. |
 | Çok yavaş | **⚡ Hızlı** modeli seçin veya hedef çözünürlüğü düşürün; önce **Başlangıç/Bitiş** ile kısa bir parça deneyin. |
-| Link indirilemedi | Site Colab'ı engellemiş olabilir (özellikle YouTube). Videoyu indirip yükleyin veya Drive'a koyun. |
+| YouTube: "bot olmadığını doğrula" | **🍪 YouTube çerezi** ile cookies.txt yükleyip **↻ Tekrar dene** (yukarıdaki adımlar). Çerez yüklüyken de oluyorsa çerezleri gizli pencere yöntemiyle yeniden dışa aktarın. |
+| Link indirilemedi (diğer) | Hata kartındaki Türkçe açıklamaya bakın; site Colab'ı engelliyorsa videoyu indirip yükleyin veya Drive'a koyun. |
 | "Drive'dan seç" butonu yok | Colab formunda `DRIVE_KAYDET`'i açıp hücreyi yeniden çalıştırın. |
 
 ## Lisanslar

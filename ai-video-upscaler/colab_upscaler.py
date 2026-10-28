@@ -50,7 +50,7 @@ import uuid
 from fractions import Fraction
 from pathlib import Path
 
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 
 try:
     IN_COLAB = importlib.util.find_spec("google.colab") is not None
@@ -69,6 +69,7 @@ if os.environ.get("UPSCALER_DRIVE_KAYDET"):
 PORT = int(os.environ.get("UPSCALER_PORT", "7860"))
 BASE = Path(os.environ.get("UPSCALER_DIR") or ("/content/ai_upscaler" if IN_COLAB else "ai_upscaler_data")).resolve()
 UP_DIR, OUT_DIR, WORK_DIR, MODEL_DIR, BIN_DIR = (BASE / d for d in ("uploads", "outputs", "work", "models", "bin"))
+COOKIES = BASE / "yt_cookies.txt"  # YouTube "bot değilim" doğrulaması için kullanıcının yüklediği cookies.txt
 DRIVE_ROOT = Path(os.environ.get("UPSCALER_DRIVE_ROOT") or "/content/drive/MyDrive")
 DRIVE_DIR = None  # Drive bağlıysa: DRIVE_ROOT / "AI_Upscaler"
 CHUNK = 8 * 1024 * 1024
@@ -932,7 +933,7 @@ def snapshot():
             out.append(d)
         srcs = [{k: s.get(k) for k in SRC_KEYS} for s in sorted(SOURCES.values(), key=lambda s: s["created"])]
         return {"jobs": out, "sources": srcs, "version": STATE["version"], "dl_base": DL_STATE["base"],
-                "drive": bool(DRIVE_DIR)}
+                "drive": bool(DRIVE_DIR), "cookies": COOKIES.exists(), "password": bool(SIFRE)}
 
 
 def sys_monitor(stop_event):
@@ -1040,15 +1041,73 @@ def _download_direct(src, url, require_video=False):
     return True
 
 
+_YTDLP = {"ready": False}
+
+
 def _ensure_ytdlp():
-    if importlib.util.find_spec("yt_dlp") is None or importlib.util.find_spec("yt_dlp_ejs") is None:
-        log("yt-dlp kuruluyor (YouTube ve diğer siteler için)…")
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "yt-dlp[default]", "deno"], check=True)
+    if not _YTDLP["ready"]:  # oturum başına bir kez en güncel sürüme yükselt (YouTube değişikliklerine karşı)
+        log("yt-dlp kuruluyor/güncelleniyor (YouTube ve diğer siteler için)…")
+        r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "yt-dlp[default]", "deno"])
+        if r.returncode != 0 and importlib.util.find_spec("yt_dlp") is None:
+            raise RuntimeError("yt-dlp kurulamadı.")
+        _YTDLP["ready"] = True
     deno = shutil.which("deno") or shutil.which("deno", path=str(Path(sys.executable).parent))
     env = dict(os.environ)
     if deno:  # YouTube için JavaScript çalışma zamanı
         env["PATH"] = str(Path(deno).parent) + os.pathsep + env.get("PATH", "")
     return env
+
+
+def save_cookies(raw):
+    """Tarayıcıdan dışa aktarılmış Netscape cookies.txt dosyasını doğrulayıp kaydet."""
+    text = raw.decode("utf-8", "ignore").lstrip("﻿").replace("\r\n", "\n").replace("\r", "\n")
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    rows = [ln.split("\t") for ln in lines if not ln.startswith("#") or ln.startswith("#HttpOnly_")]
+    rows = [r for r in rows if len(r) >= 7]
+    if not rows:
+        raise ValueError("Bu dosya cookies.txt (Netscape) biçiminde değil. Eklentide JSON değil 'cookies.txt' "
+                         "biçimini seçin.")
+
+    def domain(r):
+        d = r[0][len("#HttpOnly_"):] if r[0].startswith("#HttpOnly_") else r[0]
+        return d.lstrip(".").lower()
+
+    if not any(domain(r).endswith(("youtube.com", "google.com")) for r in rows):
+        raise ValueError("Dosyada youtube.com çerezi yok; çerezleri YouTube sekmesindeyken dışa aktarın.")
+    if not lines[0].startswith(("# HTTP Cookie File", "# Netscape HTTP Cookie File")):
+        text = "# Netscape HTTP Cookie File\n" + text
+    fd = os.open(COOKIES, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text if text.endswith("\n") else text + "\n")
+    return len(rows)
+
+
+def friendly_dl_error(text):
+    """yt-dlp hata metnini anlaşılır Türkçe açıklamaya çevir."""
+    t = text.lower()
+    cookie_hint = ("Yüklü çerezler geçersiz veya süresi dolmuş olabilir: gizli pencere yöntemiyle yeniden dışa "
+                   "aktarıp yükleyin." if COOKIES.exists() else
+                   "Çözüm: 🍪 YouTube çerezi butonundaki adımlarla cookies.txt yükleyip ↻ Tekrar dene'ye basın.")
+    if "not a bot" in t or ("confirm you" in t and "bot" in t):
+        return (f"YouTube, Colab sunucusunu bot sandı ve giriş doğrulaması istiyor. {cookie_hint} "
+                "(Alternatif: videoyu kendi bilgisayarınıza indirip yükleyin.)")
+    if "confirm your age" in t or "age-restricted" in t or "inappropriate for some users" in t:
+        return f"Yaş doğrulamalı video. {cookie_hint}"
+    if "private video" in t:
+        return "Bu video gizli; videoyu görebilen bir hesabın çerezlerini yükleyin."
+    if "members-only" in t or "join this channel" in t:
+        return "Bu video yalnızca kanal üyelerine açık."
+    if "video unavailable" in t or "is not available" in t:
+        return "Video kullanılamıyor (kaldırılmış, gizli ya da bölgede engelli olabilir)."
+    if "unsupported url" in t:
+        return "Bu link desteklenmiyor. Doğrudan video linki, YouTube veya Google Drive linki deneyin."
+    if "http error 403" in t or "403: forbidden" in t:
+        return "Site erişimi reddetti (403). Videoyu indirip yükleyin."
+    if "http error 404" in t or "404: not found" in t:
+        return "Link bulunamadı (404). Linki kontrol edin."
+    if "timed out" in t or "name or service not known" in t or "temporary failure in name resolution" in t:
+        return "Siteye bağlanılamadı (zaman aşımı/adres bulunamadı). Linki kontrol edip tekrar deneyin."
+    return text[:500]
 
 
 def _download_ytdlp(src, url):
@@ -1057,6 +1116,8 @@ def _download_ytdlp(src, url):
            "-N", "4", "--newline", "--progress", "--progress-template",
            "download:[dl] %(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
            "--print", "after_move:[ok] %(title)s", "-o", str(UP_DIR / f"{src['id']}.%(ext)s"), url]
+    if COOKIES.exists():
+        cmd[3:3] = ["--cookies", str(COOKIES)]
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     title, tail, last = None, [], 0.0
     for line in p.stdout:
@@ -1080,7 +1141,9 @@ def _download_ytdlp(src, url):
              if f.suffix.lower() not in (".json", ".part", ".ytdl", ".tmp") and ".part" not in f.name]
     if rc != 0 or not files:
         detail = " | ".join(t for t in tail if "ERROR" in t or "error" in t) or (tail[-1] if tail else "")
-        raise RuntimeError(f"Link indirilemedi: {detail[-400:]}" if detail else "Link indirilemedi.")
+        if detail:
+            log(f"yt-dlp: {detail[:600]}")
+        raise RuntimeError(friendly_dl_error(detail) if detail else "Link indirilemedi.")
     f = max(files, key=lambda x: x.stat().st_size)
     src_set(src, path=str(f), name=f"{(title or 'video')[:120]}{f.suffix}", size=f.stat().st_size)
 
@@ -1097,7 +1160,7 @@ def import_url(src, url):
                     raise
         finalize_source(src)
     except Exception as e:  # noqa: BLE001
-        src_set(src, status="error", stage="", error=str(e)[-500:])
+        src_set(src, status="error", stage="", error=friendly_dl_error(str(e)))
         log(f"Link indirilemedi ({url}): {e}")
 
 
@@ -1546,6 +1609,12 @@ input[type=text]:focus{outline:2px solid var(--acc);outline-offset:1px}
 .drow:last-child{border-bottom:0}
 .drow .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px}
 .upstat{margin-top:10px;font-size:13px;color:var(--muted);min-height:1em}
+.ckpanel{margin-top:10px;padding:14px;border-radius:12px;background:#0b0f1a;border:1px solid var(--line);font-size:13.5px;line-height:1.6}
+.ckpanel ol{margin:8px 0 12px;padding-left:20px}
+.ckpanel code{background:#1a2133;padding:1px 6px;border-radius:6px;font-size:12.5px;word-break:break-all}
+.ckrow{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.ckrow span{flex:1;min-width:180px}
+label.btn{display:inline-block;cursor:pointer}
 .src{display:flex;gap:12px;align-items:center;padding:10px;border:1px solid var(--line);border-radius:13px;background:var(--card2);margin-top:10px;transition:.15s}
 .src.sel{border-color:var(--acc);box-shadow:inset 0 0 0 1px var(--acc)}
 .src .th{width:104px;height:58px;border-radius:9px;object-fit:cover;background:#0b0f1a;flex:none;display:grid;place-items:center;font-size:22px}
@@ -1645,8 +1714,27 @@ footer{color:var(--muted);font-size:12.5px;text-align:center;margin-top:26px;lin
       <input type="text" id="urlIn" placeholder="…veya link yapıştırın: YouTube, Google Drive, doğrudan video linki" aria-label="Video linki">
       <button class="btn sm" id="urlBtn">🔗 Linkten ekle</button>
       <button class="btn sm ghost" id="driveBtn" hidden>📁 Drive'dan seç</button>
+      <button class="btn sm ghost" id="ckBtn">🍪 YouTube çerezi</button>
     </div>
     <div class="drivepanel" id="drivePanel" hidden></div>
+    <div class="ckpanel" id="ckPanel" hidden>
+      <div><b>YouTube "bot olmadığını doğrula" hatası için</b> — Colab sunucuları veri merkezinde olduğu için YouTube bazen
+        giriş ister. Tarayıcınızdan alacağınız <code>cookies.txt</code> dosyasını bir kez yüklemeniz yeterli:</div>
+      <ol>
+        <li>Tarayıcınıza <b>Get cookies.txt LOCALLY</b> (Chrome/Edge) veya <b>cookies.txt</b> (Firefox) eklentisini kurun.
+          Adında "LOCALLY" olmayan eski Chrome eklentisini <b>kullanmayın</b>. Eklentinin gizli pencerede çalışmasına izin
+          verin (Chrome: Uzantılar → eklenti → Ayrıntılar → <i>Gizli modda izin ver</i>; Firefox: <i>Gizli pencerelerde çalıştır</i>).</li>
+        <li>Bir <b>gizli/özel pencere</b> açıp YouTube'a giriş yapın — mümkünse <b>yedek bir Google hesabıyla</b>.</li>
+        <li>Aynı sekmede <code>https://www.youtube.com/robots.txt</code> adresini açın ve eklentiyle çerezleri
+          <b>Export</b> edin (biçim: cookies.txt / Netscape).</li>
+        <li>Gizli pencereyi kapatın (açık kalırsa YouTube çerezleri yeniler ve dosya geçersizleşir), dosyayı aşağıdan yükleyin.</li>
+      </ol>
+      <div class="ckrow"><span id="ckStatus">Henüz çerez yüklenmedi.</span>
+        <label class="btn sm ghost">📄 cookies.txt seç<input type="file" id="ckFile" accept=".txt,text/plain" hidden></label>
+        <button class="btn sm red" id="ckDel" hidden>Sil</button></div>
+      <div class="note">⚠️ yt-dlp ile kullanılan hesapların YouTube tarafından kısıtlanma riski vardır; ana hesabınızı kullanmayın.
+        Dosya yalnızca bu Colab oturumunda saklanır.<span id="ckPw"> Çerez yüklediyseniz Colab formundan siteye <b>SIFRE</b> koymanız önerilir.</span></div>
+    </div>
     <div class="upstat" id="upStat"></div>
     <div class="srcbar" id="srcBar" hidden><span id="srcCount"></span><button class="linkbtn" id="selAll">Tümünü seç</button><button class="linkbtn" id="selNone">Seçimi kaldır</button></div>
     <div id="srcList"></div>
@@ -1781,7 +1869,10 @@ function srcHtml(s){
   const ready = s.status==="ready", sel = ready && selected.has(s.id), i = s.info || {};
   const pills = ready ? [`${i.width}×${i.height}`, `${i.fps} FPS`, fmtClock(i.duration), (i.codec||"")+(i.bits>8?` ${i.bits}-bit`:""), i.has_audio?"🔊 "+(i.acodec||"ses"):"🔇 sessiz"].concat(i.hdr?["HDR"]:[]) : [];
   let status = "";
-  if(s.status==="error") status = `<div class="errm">${esc(s.error||"Hata")}</div>`;
+  if(s.status==="error"){
+    status = `<div class="errm">${esc(s.error||"Hata")}</div>`;
+    if(s.origin==="url") status += `<div class="acts" style="margin-top:8px"><button class="btn sm ghost" data-act="src-retry" data-id="${s.id}">↻ Tekrar dene</button>${/çerez|cookie/i.test(s.error||"")?`<button class="btn sm ghost" data-act="ck-open">🍪 Çerez yükle</button>`:""}</div>`;
+  }
   else if(!ready) status = `<div class="bar"><i style="width:${((s.progress||0)*100).toFixed(1)}%"></i></div><div class="muted">${esc(SRC_STATUS[s.status]||s.status)}${s.stage?" · "+esc(s.stage):""}</div>`;
   const thumb = s.thumb ? `<img class="th" src="/api/sources/${s.id}/thumb" alt="" loading="lazy">` : `<div class="th">${s.status==="error"?"⚠️":ready?"🎞️":"⏳"}</div>`;
   const origin = {url:"🔗 ", drive:"📁 "}[s.origin] || "";
@@ -1953,6 +2044,9 @@ function setSplit(p){ pvPos = Math.min(1, Math.max(0, p)); $("cmpB").style.clipP
 function onSnapshot(d){
   if("dl_base" in d) S.dlBase = d.dl_base;
   S.drive = !!d.drive; $("driveBtn").hidden = !S.drive;
+  $("ckBtn").textContent = d.cookies ? "🍪 Çerez yüklü ✓" : "🍪 YouTube çerezi";
+  $("ckStatus").textContent = d.cookies ? "✅ Çerez yüklü — YouTube indirmelerinde otomatik kullanılıyor." : "Henüz çerez yüklenmedi.";
+  $("ckDel").hidden = !d.cookies; $("ckPw").hidden = !!d.password;
   const ids = new Set(d.sources.map(s=>s.id));
   if(known===null){ known = new Set(d.sources.filter(s=>s.status==="ready").map(s=>s.id)); }
   for(const s of d.sources) if(s.status==="ready" && !known.has(s.id)){ known.add(s.id); selected.add(s.id); }
@@ -2016,10 +2110,25 @@ $("srcList").addEventListener("change", e=>{
   save("v3_sel", [...selected]); renderSources(); updateSummary();
 });
 $("srcList").addEventListener("click", async e=>{
-  const b = e.target.closest("[data-act=src-del]"); if(!b) return;
+  const b = e.target.closest("[data-act]"); if(!b) return;
+  if(b.dataset.act==="ck-open"){ $("ckPanel").hidden = false; $("ckPanel").scrollIntoView({behavior:"smooth", block:"center"}); return; }
+  if(b.dataset.act==="src-retry"){ b.disabled = true; try{ await post(`/api/sources/${b.dataset.id}/retry`); refresh(); }catch(x){ toast(x.message); b.disabled = false; } return; }
+  if(b.dataset.act!=="src-del") return;
   if(!confirm("Bu video listeden kaldırılıp Colab diskinden silinsin mi?")) return;
   try{ await api(`/api/sources/${b.dataset.id}`, {method:"DELETE"}); refresh(); }catch(x){ toast(x.message); }
 });
+$("ckBtn").onclick=()=>{ $("ckPanel").hidden = !$("ckPanel").hidden; };
+$("ckFile").onchange=async()=>{
+  const f = $("ckFile").files[0]; $("ckFile").value = ""; if(!f) return;
+  try{
+    const r = await api("/api/cookies", {method:"POST", headers:{"Content-Type":"text/plain"}, body: await f.text()});
+    toast(`🍪 ${r.count} çerez yüklendi. Başarısız linkleri ↻ Tekrar dene ile yeniden deneyin.`); refresh();
+  }catch(x){ toast("Çerez yüklenemedi: "+x.message); }
+};
+$("ckDel").onclick=async()=>{
+  if(!confirm("Yüklü YouTube çerezleri silinsin mi?")) return;
+  try{ await api("/api/cookies", {method:"DELETE"}); refresh(); }catch(x){ toast(x.message); }
+};
 $("jobs").addEventListener("click", async e=>{
   const b = e.target.closest("[data-act]"); if(!b) return;
   if(b.dataset.act==="job-retry"){ try{ await post(`/api/jobs/${b.dataset.id}/retry`); toast("↻ Yeniden kuyruğa eklendi"); }catch(x){ toast(x.message); } }
@@ -2201,9 +2310,42 @@ def create_app(stop_event):
             raise HTTPException(400, "Geçerli bir http(s) linki girin.")
         name = urllib.parse.urlparse(url).netloc + "…"
         src = new_source(name, "url", 0, "downloading", "")
-        src_set(src, stage="Bağlanılıyor")
+        src_set(src, stage="Bağlanılıyor", url=url)
         threading.Thread(target=import_url, args=(src, url), daemon=True).start()
         return {k: src.get(k) for k in SRC_KEYS}
+
+    @app.post("/api/sources/{sid}/retry")
+    async def retry_source(sid: str):
+        src = get_source(sid, ready=False)
+        if src["origin"] != "url" or src["status"] != "error" or not src.get("url"):
+            raise HTTPException(409, "Yalnızca başarısız link indirmeleri tekrar denenebilir.")
+        for f in UP_DIR.glob(f"{sid}.*"):  # yarım kalan parçaları temizle
+            if f.suffix != ".json":
+                f.unlink(missing_ok=True)
+        src_set(src, status="downloading", stage="Bağlanılıyor", error=None, progress=0.0)
+        threading.Thread(target=import_url, args=(src, src["url"]), daemon=True).start()
+        return {k: src.get(k) for k in SRC_KEYS}
+
+    @app.post("/api/cookies")
+    async def upload_cookies(req: Request):
+        raw = bytearray()
+        async for part in req.stream():
+            raw += part
+            if len(raw) > 2 * 1024 * 1024:
+                raise HTTPException(413, "Dosya çok büyük; yalnızca youtube.com çerezlerini dışa aktarın.")
+        try:
+            n = await run_in_threadpool(save_cookies, bytes(raw))
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        bump()
+        log(f"🍪 YouTube çerezleri yüklendi ({n} çerez)")
+        return {"present": True, "count": n}
+
+    @app.delete("/api/cookies")
+    async def delete_cookies():
+        COOKIES.unlink(missing_ok=True)
+        bump()
+        return {"present": False}
 
     @app.get("/api/drive")
     async def drive_list():
